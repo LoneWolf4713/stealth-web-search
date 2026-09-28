@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Fast / MCPServer for Stealth Web Search & Neural Retrieval.
-Exposes tools natively to Claude Code and Google Antigravity.
-Compatible with MCP SDK v1 and v2.
+MCP Server for Web Search & Intelligent Information Retrieval.
+Provides search, webpage fetching, documentation outline inspection,
+and summarized multi-source research tools for AI coding assistants.
 """
 import os
 import sys
@@ -13,10 +13,10 @@ if SCRIPT_DIR not in sys.path:
 
 try:
     from mcp.server.mcpserver import MCPServer
-    mcp = MCPServer("stealth-web-retriever")
+    mcp = MCPServer("web-search-tools")
 except (ImportError, ModuleNotFoundError):
     from mcp.server.fastmcp import FastMCP
-    mcp = FastMCP("stealth-web-retriever")
+    mcp = FastMCP("web-search-tools")
 
 from searcher import search_web, search_news
 from fetcher import fetch_page
@@ -26,12 +26,15 @@ from parallel_pipeline import fast_intelligent_search, format_fast_digest
 @mcp.tool()
 def search(query: str, max_results: int = 5, perspective: str = "tech") -> str:
     """
-    Search the live web without API keys or rate limits (cached via SQLite).
-    perspective options:
-      - 'tech' (default): Open-source repositories, developer architecture, implementation details.
-      - 'market': Commercial startups, consumer products, pricing, competitors.
-      - 'dual': Concurrent balanced split across technical code bases AND commercial landscape.
-    Returns structured results including titles, links, perspective tags, and snippets.
+    Search the web for up-to-date information, technical documentation, or industry data.
+    
+    Args:
+        query: The search terms or question.
+        max_results: Maximum number of search results to return (default: 5).
+        perspective: Search perspective filter:
+            - 'tech' (default): Technical documentation, repositories, developer guides.
+            - 'market': Products, startups, pricing, and comparison articles.
+            - 'dual': Balanced search retrieving both technical and market perspectives.
     """
     results = search_web(query, max_results=max_results, perspective=perspective)
     if not results:
@@ -45,18 +48,26 @@ def search(query: str, max_results: int = 5, perspective: str = "tech") -> str:
     return "\n".join(out)
 
 @mcp.tool()
-def fetch(url: str, force_stealth: bool = False) -> str:
+def fetch(url: str, force_browser: bool = False, force_stealth: bool = False) -> str:
     """
-    Fetch any webpage bypassing Cloudflare, Akamai, or anti-bot protections.
-    Converts HTML into clean, token-efficient Markdown with cookie vault caching.
+    Fetch the content of a webpage and convert it to clean, readable Markdown format.
+    
+    Args:
+        url: The web URL to fetch.
+        force_browser: Set to True to use browser rendering for dynamic JavaScript pages.
+        force_stealth: Legacy alias for force_browser.
     """
-    return fetch_page(url, force_stealth=force_stealth)
+    use_browser = force_browser or force_stealth
+    return fetch_page(url, force_stealth=use_browser)
 
 @mcp.tool()
 def get_toc(url: str) -> str:
     """
-    Get the Table of Contents outline of a large documentation page (~150 tokens).
-    Use this to see all section headings before reading full content.
+    Get the Table of Contents outline of a documentation page or article.
+    Use this first on long pages to locate specific sections without reading the entire document.
+    
+    Args:
+        url: The web URL to inspect.
     """
     content = fetch_page(url)
     return get_table_of_contents(content)
@@ -64,8 +75,12 @@ def get_toc(url: str) -> str:
 @mcp.tool()
 def read_section(url: str, section_name_or_index: str) -> str:
     """
-    Read only a specific section from a webpage or documentation by heading name or index.
-    Saves context tokens by extracting only the requested sub-topic.
+    Read a specific section from a webpage or document by its heading name or index number.
+    Extracts only the requested section to save context space.
+    
+    Args:
+        url: The webpage URL.
+        section_name_or_index: Heading title or numerical index obtained from get_toc.
     """
     content = fetch_page(url)
     return extract_section(content, section_name_or_index)
@@ -73,11 +88,14 @@ def read_section(url: str, section_name_or_index: str) -> str:
 @mcp.tool()
 def fast_neural_search(query: str, instruction: str = "", num_pages: int = 4, perspective: str = "tech") -> str:
     """
-    Fast Neural Search Mode:
-    Searches web -> parallel crawls pages -> preserves code blocks -> neural cross-encoder
-    reranks most relevant passages -> GLiNER extracts named entities and dates.
-    Zero information loss, 80%+ token reduction.
-    perspective options: 'tech' (default), 'market', or 'dual'.
+    Perform an intelligent multi-source web search that fetches relevant pages,
+    reranks the most pertinent passages, and extracts key entities and facts.
+    
+    Args:
+        query: The search topic or question.
+        instruction: Optional guidance for prioritizing specific types of information.
+        num_pages: Number of pages to analyze (default: 4).
+        perspective: 'tech' (default), 'market', or 'dual'.
     """
     data = fast_intelligent_search(
         query,
@@ -90,12 +108,14 @@ def fast_neural_search(query: str, instruction: str = "", num_pages: int = 4, pe
 @mcp.tool()
 def deep_reasoning_search(query: str, reasoning_intent: str = "", num_pages: int = 3, perspective: str = "tech") -> str:
     """
-    Deep Reasoning Search Mode (Phase 2):
-    Use this when queries are broad, vague, or require semantic deduction
-    (e.g., 'opportunities for me next year', complex bug synthesis across forums).
-    Uses a local quantized Gemma 2 2B SLM to extract exact entities, dates, and solutions
-    without information loss.
-    perspective options: 'tech' (default), 'market', or 'dual'.
+    Perform comprehensive in-depth research using local language model analysis.
+    Crawls source pages and synthesizes structured findings, key details, and solutions.
+    
+    Args:
+        query: The research query or topic.
+        reasoning_intent: Specific research goals or requirements to focus on.
+        num_pages: Number of pages to analyze (default: 3).
+        perspective: 'tech' (default), 'market', or 'dual'.
     """
     from parallel_pipeline import deep_reasoning_search as run_deep, format_deep_digest
     data = run_deep(

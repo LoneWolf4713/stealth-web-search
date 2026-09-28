@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CLI entry point for high-performance stealth search and retrieval.
+CLI entry point for web search and information retrieval.
 """
 import sys
 import json
@@ -15,7 +15,7 @@ from chunker import get_table_of_contents, extract_section
 from parallel_pipeline import fast_intelligent_search, format_fast_digest
 from neural_fast import get_device
 
-app = typer.Typer(help="Stealth Web Search & Neural Retrieval CLI for AI Coding Agents")
+app = typer.Typer(help="Web Search & Information Retrieval CLI for AI Coding Agents")
 console = Console()
 
 @app.command()
@@ -46,11 +46,11 @@ def search(
 @app.command()
 def fetch(
     url: str = typer.Argument(..., help="Webpage URL to fetch"),
-    force_stealth: bool = typer.Option(False, "--stealth", "-s", help="Force C++ browser mode"),
+    force_stealth: bool = typer.Option(False, "--browser", "-b", help="Use browser rendering"),
     no_cache: bool = typer.Option(False, "--no-cache", help="Bypass SQLite cache"),
     output_file: str = typer.Option("", "--out", "-o", help="Save markdown to file")
 ):
-    """Fetch any webpage bypassing Cloudflare/WAFs with cookie vault support."""
+    """Fetch any webpage and convert to Markdown format."""
     console.print(f"[dim]Fetching {url}...[/dim]")
     content = fetch_page(url, force_stealth=force_stealth, use_cache=not no_cache)
     
