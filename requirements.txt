@@ -1,0 +1,24 @@
+# Core Search & Retrieval
+ddgs>=9.16.0
+curl_cffi>=0.16.3
+camoufox>=0.5.6
+trafilatura>=2.2.0
+
+# CLI & Formatting
+typer>=0.27.0
+rich>=15.0.0
+
+# Neural Reranking & NER (Phase 1)
+torch>=2.14.0
+transformers>=5.16.0
+gliner>=0.2.29
+protobuf>=7.0.0
+tiktoken>=0.14.0
+
+# Deep Reasoning (Phase 2 - Local SLM)
+# Install llama-cpp-python with CUDA:
+# CMAKE_ARGS="-DGGML_CUDA=on -DGGML_AVX512=off -DCMAKE_CUDA_ARCHITECTURES=86" pip install llama-cpp-python
+llama-cpp-python>=0.3.35
+
+# MCP Server
+mcp>=2.2.0
