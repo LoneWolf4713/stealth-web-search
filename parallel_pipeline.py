@@ -12,12 +12,49 @@ import time
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import gc
+
 from searcher import search_web, search_news
 from fetcher import fetch_page
 from chunker import chunk_markdown_smart, get_table_of_contents, extract_section
 from neural_fast import rerank_chunks, extract_entities, get_device
 
-DEFAULT_WORKERS = max(8, (os.cpu_count() or 4) * 2)
+import fcntl
+
+# Throttled worker count to prevent WSL memory exhaustion
+DEFAULT_WORKERS = min(3, os.cpu_count() or 2)
+
+class MLHardwareLock:
+    """Cross-process lock to prevent concurrent ML model runs from exceeding system RAM/VRAM."""
+    def __init__(self, lock_path="/tmp/web_search_ml.lock"):
+        self.lock_path = lock_path
+        self.fd = None
+
+    def __enter__(self):
+        try:
+            self.fd = open(self.lock_path, "w")
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+        except Exception:
+            pass
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.fd:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+                self.fd.close()
+            except Exception:
+                pass
+
+def _cleanup_memory():
+    """Explicitly clean up garbage and release CUDA VRAM back to OS."""
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 def process_single_url(
     item: Dict[str, Any],
@@ -113,25 +150,28 @@ def fast_intelligent_search(
         }
 
     detailed_results = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(
-                process_single_url,
-                item,
-                query,
-                instruction,
-                extract_ner,
-                top_chunks_per_page
-            ): item
-            for item in search_results
-        }
-        for f in as_completed(futures):
-            res = f.result()
-            orig = futures[f]
-            res["perspective"] = orig.get("perspective", "tech")
-            detailed_results.append(res)
+    with MLHardwareLock():
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    process_single_url,
+                    item,
+                    query,
+                    instruction,
+                    extract_ner,
+                    top_chunks_per_page
+                ): item
+                for item in search_results
+            }
+            for f in as_completed(futures):
+                res = f.result()
+                orig = futures[f]
+                res["perspective"] = orig.get("perspective", "tech")
+                detailed_results.append(res)
 
-    elapsed = round(time.perf_counter() - t0, 3)
+        elapsed = round(time.perf_counter() - t0, 3)
+        _cleanup_memory()
+
     return {
         "query": query,
         "perspective": perspective,
@@ -215,38 +255,41 @@ def deep_reasoning_search(
         }
 
     detailed_results = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_item = {
-            executor.submit(fetch_page, item.get("href", "")): item
-            for item in search_results
-            if item.get("href")
-        }
-        for future in as_completed(future_to_item):
-            item = future_to_item[future]
-            url = item.get("href", "")
-            title = item.get("title", "")
-            try:
-                content = future.result()
-                intelligence = extract_deep_intelligence(content, query, reasoning_intent)
-                detailed_results.append({
-                    "title": title,
-                    "url": url,
-                    "perspective": item.get("perspective", "tech"),
-                    "snippet": item.get("body", ""),
-                    "extracted_intelligence": intelligence,
-                    "status": "success"
-                })
-            except Exception as e:
-                detailed_results.append({
-                    "title": title,
-                    "url": url,
-                    "perspective": item.get("perspective", "tech"),
-                    "snippet": item.get("body", ""),
-                    "extracted_intelligence": f"Error during reasoning: {str(e)}",
-                    "status": "error"
-                })
+    with MLHardwareLock():
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_item = {
+                executor.submit(fetch_page, item.get("href", "")): item
+                for item in search_results
+                if item.get("href")
+            }
+            for future in as_completed(future_to_item):
+                item = future_to_item[future]
+                url = item.get("href", "")
+                title = item.get("title", "")
+                try:
+                    content = future.result()
+                    intelligence = extract_deep_intelligence(content, query, reasoning_intent)
+                    detailed_results.append({
+                        "title": title,
+                        "url": url,
+                        "perspective": item.get("perspective", "tech"),
+                        "snippet": item.get("body", ""),
+                        "extracted_intelligence": intelligence,
+                        "status": "success"
+                    })
+                except Exception as e:
+                    detailed_results.append({
+                        "title": title,
+                        "url": url,
+                        "perspective": item.get("perspective", "tech"),
+                        "snippet": item.get("body", ""),
+                        "extracted_intelligence": f"Error during reasoning: {str(e)}",
+                        "status": "error"
+                    })
 
-    elapsed = round(time.perf_counter() - t0, 3)
+        elapsed = round(time.perf_counter() - t0, 3)
+        _cleanup_memory()
+
     return {
         "query": query,
         "perspective": perspective,

@@ -124,6 +124,10 @@ Add this to your `~/.claude.json` or desktop configuration:
 | `fast_neural_search` | Multi-source search with passage ranking | `query` (str), `instruction` (str), `num_pages` (int), `perspective` |
 | `deep_reasoning_search` | In-depth synthesized research | `query` (str), `reasoning_intent` (str), `num_pages` (int), `perspective` |
 
+### Best Practices for AI Agents
+- **Sequential Execution**: Agents should invoke tools sequentially rather than firing multiple searches in parallel in a single turn. The server includes automatic hardware semaphores to queue simultaneous requests and protect system memory.
+- **Progressive Depth**: Use `search` for fast single lookups, `fast_neural_search` (< 1s) for multi-source passage extraction, and `deep_reasoning_search` for complex cross-document deduction.
+
 ---
 
 ## License

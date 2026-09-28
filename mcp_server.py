@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """
-MCP Server for Web Search & Intelligent Information Retrieval.
+MCP Server for Web Search & Information Retrieval.
 Provides search, webpage fetching, documentation outline inspection,
 and summarized multi-source research tools for AI coding assistants.
+
+Hardware-Protection Architecture:
+Enforces in-memory concurrency semaphores to queue multiple simultaneous
+agent requests safely, preventing system RAM exhaustion in constrained (WSL) environments.
 """
 import os
 import sys
+import threading
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
@@ -23,10 +28,19 @@ from fetcher import fetch_page
 from chunker import get_table_of_contents, extract_section
 from parallel_pipeline import fast_intelligent_search, format_fast_digest
 
+# Concurrency throttling semaphores to protect system memory:
+# Heavy ML models (CrossEncoder, GLiNER, Gemma SLM) run 1 at a time.
+# Parallel agent requests are automatically queued safely.
+_ML_SEMAPHORE = threading.Semaphore(1)
+_FETCH_SEMAPHORE = threading.Semaphore(2)
+_SEARCH_SEMAPHORE = threading.Semaphore(3)
+
 @mcp.tool()
 def search(query: str, max_results: int = 5, perspective: str = "tech") -> str:
     """
     Search the web for up-to-date information, technical documentation, or industry data.
+    
+    IMPORTANT: Execute queries sequentially. Await each response before issuing another search.
     
     Args:
         query: The search terms or question.
@@ -36,16 +50,17 @@ def search(query: str, max_results: int = 5, perspective: str = "tech") -> str:
             - 'market': Products, startups, pricing, and comparison articles.
             - 'dual': Balanced search retrieving both technical and market perspectives.
     """
-    results = search_web(query, max_results=max_results, perspective=perspective)
-    if not results:
-        return "No results found."
-    
-    out = []
-    for idx, r in enumerate(results, 1):
-        p_tag = f" [{r.get('perspective', 'tech').upper()}]" if perspective == "dual" else ""
-        out.append(f"{idx}. [{r.get('title')}]({r.get('href')}){p_tag}")
-        out.append(f"   {r.get('body')}\n")
-    return "\n".join(out)
+    with _SEARCH_SEMAPHORE:
+        results = search_web(query, max_results=max_results, perspective=perspective)
+        if not results:
+            return "No results found."
+        
+        out = []
+        for idx, r in enumerate(results, 1):
+            p_tag = f" [{r.get('perspective', 'tech').upper()}]" if perspective == "dual" else ""
+            out.append(f"{idx}. [{r.get('title')}]({r.get('href')}){p_tag}")
+            out.append(f"   {r.get('body')}\n")
+        return "\n".join(out)
 
 @mcp.tool()
 def fetch(url: str, force_browser: bool = False, force_stealth: bool = False) -> str:
@@ -57,8 +72,9 @@ def fetch(url: str, force_browser: bool = False, force_stealth: bool = False) ->
         force_browser: Set to True to use browser rendering for dynamic JavaScript pages.
         force_stealth: Legacy alias for force_browser.
     """
-    use_browser = force_browser or force_stealth
-    return fetch_page(url, force_stealth=use_browser)
+    with _FETCH_SEMAPHORE:
+        use_browser = force_browser or force_stealth
+        return fetch_page(url, force_stealth=use_browser)
 
 @mcp.tool()
 def get_toc(url: str) -> str:
@@ -69,8 +85,9 @@ def get_toc(url: str) -> str:
     Args:
         url: The web URL to inspect.
     """
-    content = fetch_page(url)
-    return get_table_of_contents(content)
+    with _FETCH_SEMAPHORE:
+        content = fetch_page(url)
+        return get_table_of_contents(content)
 
 @mcp.tool()
 def read_section(url: str, section_name_or_index: str) -> str:
@@ -82,8 +99,9 @@ def read_section(url: str, section_name_or_index: str) -> str:
         url: The webpage URL.
         section_name_or_index: Heading title or numerical index obtained from get_toc.
     """
-    content = fetch_page(url)
-    return extract_section(content, section_name_or_index)
+    with _FETCH_SEMAPHORE:
+        content = fetch_page(url)
+        return extract_section(content, section_name_or_index)
 
 @mcp.tool()
 def fast_neural_search(query: str, instruction: str = "", num_pages: int = 4, perspective: str = "tech") -> str:
@@ -91,19 +109,23 @@ def fast_neural_search(query: str, instruction: str = "", num_pages: int = 4, pe
     Perform an intelligent multi-source web search that fetches relevant pages,
     reranks the most pertinent passages, and extracts key entities and facts.
     
+    IMPORTANT FOR AI AGENTS: Execute queries sequentially (one at a time) rather than in parallel.
+    The local neural engine serializes queries in a queue to maintain system stability.
+    
     Args:
         query: The search topic or question.
         instruction: Optional guidance for prioritizing specific types of information.
         num_pages: Number of pages to analyze (default: 4).
         perspective: 'tech' (default), 'market', or 'dual'.
     """
-    data = fast_intelligent_search(
-        query,
-        max_results=num_pages,
-        perspective=perspective,
-        instruction=instruction if instruction else None
-    )
-    return format_fast_digest(data)
+    with _ML_SEMAPHORE:
+        data = fast_intelligent_search(
+            query,
+            max_results=num_pages,
+            perspective=perspective,
+            instruction=instruction if instruction else None
+        )
+        return format_fast_digest(data)
 
 @mcp.tool()
 def deep_reasoning_search(query: str, reasoning_intent: str = "", num_pages: int = 3, perspective: str = "tech") -> str:
@@ -111,20 +133,24 @@ def deep_reasoning_search(query: str, reasoning_intent: str = "", num_pages: int
     Perform comprehensive in-depth research using local language model analysis.
     Crawls source pages and synthesizes structured findings, key details, and solutions.
     
+    IMPORTANT FOR AI AGENTS: Execute queries sequentially (one at a time) rather than in parallel.
+    The local model serializes queries in a queue to maintain system stability.
+    
     Args:
         query: The research query or topic.
         reasoning_intent: Specific research goals or requirements to focus on.
         num_pages: Number of pages to analyze (default: 3).
         perspective: 'tech' (default), 'market', or 'dual'.
     """
-    from parallel_pipeline import deep_reasoning_search as run_deep, format_deep_digest
-    data = run_deep(
-        query,
-        perspective=perspective,
-        reasoning_intent=reasoning_intent if reasoning_intent else None,
-        max_results=num_pages
-    )
-    return format_deep_digest(data)
+    with _ML_SEMAPHORE:
+        from parallel_pipeline import deep_reasoning_search as run_deep, format_deep_digest
+        data = run_deep(
+            query,
+            perspective=perspective,
+            reasoning_intent=reasoning_intent if reasoning_intent else None,
+            max_results=num_pages
+        )
+        return format_deep_digest(data)
 
 if __name__ == "__main__":
     mcp.run()

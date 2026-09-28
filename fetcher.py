@@ -18,7 +18,10 @@ from vault import (
     extract_domain
 )
 
+import threading
+
 logger = logging.getLogger("stealth_fetcher")
+_BROWSER_LOCK = threading.Lock()
 
 CLOUDFLARE_INDICATORS = [
     "Just a moment...",
@@ -96,33 +99,34 @@ def fetch_stealth_tier(url: str, timeout: int = 25) -> Tuple[bool, str]:
     domain = extract_domain(url)
     try:
         from camoufox.sync_api import Camoufox
-        with Camoufox(headless=True) as browser:
-            page = browser.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
-            page.wait_for_timeout(2500)
-            
-            # Harvest cookies from browser session
-            try:
-                cookies = page.context.cookies()
-                cookie_dict = {c["name"]: c["value"] for c in cookies}
-                ua = page.evaluate("navigator.userAgent")
-                if "cf_clearance" in cookie_dict:
-                    save_domain_cookies(domain, cookie_dict, ua, ttl_hours=4.0)
-            except Exception:
-                pass
+        with _BROWSER_LOCK:
+            with Camoufox(headless=True) as browser:
+                page = browser.new_page()
+                page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+                page.wait_for_timeout(2500)
+                
+                # Harvest cookies from browser session
+                try:
+                    cookies = page.context.cookies()
+                    cookie_dict = {c["name"]: c["value"] for c in cookies}
+                    ua = page.evaluate("navigator.userAgent")
+                    if "cf_clearance" in cookie_dict:
+                        save_domain_cookies(domain, cookie_dict, ua, ttl_hours=4.0)
+                except Exception:
+                    pass
 
-            html = page.content()
-            md = trafilatura.extract(
-                html,
-                output_format="markdown",
-                include_links=True,
-                include_images=False,
-                favor_recall=True
-            )
-            if md and len(md.strip()) > 100:
-                set_cached_page(url, md, ttl_hours=48.0)
-                return True, md
-            return False, "Camoufox loaded page but extracted content was empty."
+                html = page.content()
+                md = trafilatura.extract(
+                    html,
+                    output_format="markdown",
+                    include_links=True,
+                    include_images=False,
+                    favor_recall=True
+                )
+                if md and len(md.strip()) > 100:
+                    set_cached_page(url, md, ttl_hours=48.0)
+                    return True, md
+                return False, "Camoufox loaded page but extracted content was empty."
     except Exception as e:
         return False, f"Tier 2 Camoufox error: {str(e)}"
 
