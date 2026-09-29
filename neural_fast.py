@@ -94,11 +94,36 @@ def extract_entities(
         for ent in sorted_raw:
             clean_name = ent.get("text", "").strip()
             norm = clean_name.lower()
+            lbl = ent.get("label", "entity").lower()
+
             if len(clean_name) < 2 or norm in seen:
                 continue
-            # Filter out numbers-only or common false positives
-            if norm in ("javascript", "browser", "cookies", "please enable", "click here", "read more"):
+
+            # Filter out raw ISO timestamps, PDF creation dates, or binary clock offsets (e.g. '2026-09-29T05')
+            if re.search(r'\d{4}-\d{2}-\d{2}T\d{2}', clean_name) or re.search(r'D:\d{8}', clean_name) or re.search(r'T\d{2}:\d{2}', clean_name):
                 continue
+
+            # Filter out pure numbers or digits with punctuation
+            if re.match(r'^[\d\s\-\:\.\/]+$', clean_name):
+                continue
+
+            # Filter out academic metadata and web crawler boilerplate
+            if any(k in norm for k in (
+                "javascript", "browser", "cookies", "please enable", "click here", "read more",
+                "similar content", "people also read", "related research", "citations",
+                "received", "accepted", "published", "revised", "doi:", "issn:", "http", "www."
+            )):
+                continue
+
+            # If tagged as deadline, ensure it contains a month, season, or time indicator
+            if lbl == "deadline":
+                has_month_or_period = any(m in norm for m in (
+                    "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+                    "spring", "summer", "fall", "winter", "annual", "cycle", "deadline"
+                ))
+                if not has_month_or_period and not re.search(r'\b(day|week|month|year|before|after)\b', norm):
+                    continue
+
             seen.add(norm)
             unique_entities.append({
                 "entity": clean_name,

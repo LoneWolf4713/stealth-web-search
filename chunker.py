@@ -217,12 +217,22 @@ def chunk_markdown_smart(
     if not markdown or len(markdown.strip()) < 50:
         return []
 
-    headings = extract_headings(markdown)
+    # Strip recommendation widgets, citation footers, and blank academic metadata fields
+    cleaned_md = re.sub(
+        r'(?i)^#{1,6}\s*(Similar content|Related research|People also read|Recommended articles|More like this|Citations \(\d+\)|References \(\d+\))[\s\S]*?(?=^#{1,6}\s|\Z)',
+        '',
+        markdown,
+        flags=re.MULTILINE
+    )
+    cleaned_md = re.sub(r'(?i)\b(Received|Accepted|Published|Revised):\s*(\n|$)', '', cleaned_md)
+    cleaned_md = re.sub(r'(?i)This site requires JavaScript to run correctly\..*?(?:unblock scripts|\Z)', '', cleaned_md, flags=re.DOTALL)
+
+    headings = extract_headings(cleaned_md)
     raw_chunks = []
 
     if not headings:
         # Paragraph-based chunking with dynamic heading labels
-        paragraphs = markdown.split("\n\n")
+        paragraphs = cleaned_md.split("\n\n")
         current_chunk = []
         current_words = 0
         for p in paragraphs:
@@ -284,6 +294,9 @@ def chunk_markdown_smart(
     seen_hashes = set()
     deduped_chunks = []
     for c in raw_chunks:
+        h_norm = c.get("heading", "").lower()
+        if any(k in h_norm for k in ("similar content", "people also read", "related research", "more like this")):
+            continue
         norm = re.sub(r'\s+', ' ', c["content"]).strip().lower()
         if len(norm) < 40:
             continue

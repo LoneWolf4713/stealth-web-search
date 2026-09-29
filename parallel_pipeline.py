@@ -23,7 +23,7 @@ from neural_fast import rerank_chunks, extract_entities, get_device
 
 # Throttled worker count to prevent memory exhaustion in constrained (WSL) environments
 DEFAULT_WORKERS = min(3, os.cpu_count() or 2)
-MAX_TOTAL_OUTPUT_CHARS = 24000  # Hard ceiling (~5,000 tokens)
+MAX_TOTAL_OUTPUT_CHARS = 25000  # Hard ceiling (25,000 characters)
 
 class MLHardwareLock:
     """Cross-process lock to prevent concurrent ML model runs from exceeding system RAM/VRAM."""
@@ -103,6 +103,20 @@ def process_single_url(
                 "entities": [],
                 "status": "failed",
                 "error_reason": "Page loaded but main content was empty or unparseable"
+            }
+
+        # Double-lock check: ensure no robot checks, JS-walls, or login walls masquerade as content
+        from fetcher import classify_page_issues
+        block_issue = classify_page_issues(content[:2500], content[:2500], url=url)
+        if block_issue and block_issue != "Page loaded but main content was empty or protected":
+            return {
+                "title": title,
+                "url": url,
+                "snippet": snippet,
+                "top_passages": [],
+                "entities": [],
+                "status": "failed",
+                "error_reason": block_issue
             }
 
         # 1. Code-block preserving semantic chunking with recursive sub-chunking
@@ -305,9 +319,9 @@ def format_fast_digest(data: Dict[str, Any]) -> str:
 
     # Enforce strict response character ceiling
     if len(full_output) > MAX_TOTAL_OUTPUT_CHARS:
-        full_output = full_output[:MAX_TOTAL_OUTPUT_CHARS - 300] + (
+        full_output = full_output[:MAX_TOTAL_OUTPUT_CHARS - 320] + (
             "\n\n> [!NOTE]\n"
-            f"> *Output capped at {MAX_TOTAL_OUTPUT_CHARS:,} characters to protect LLM context window. Showing most relevant passages.*"
+            f"> *Output capped at {MAX_TOTAL_OUTPUT_CHARS:,} characters (truncated) to protect LLM context window. Showing most relevant passages.*"
         )
 
     # Estimate token count (chars / 4.2 approx) and prepend to metrics
@@ -485,9 +499,9 @@ def format_deep_digest(data: Dict[str, Any]) -> str:
     full_output = "\n".join(lines)
 
     if len(full_output) > MAX_TOTAL_OUTPUT_CHARS:
-        full_output = full_output[:MAX_TOTAL_OUTPUT_CHARS - 300] + (
+        full_output = full_output[:MAX_TOTAL_OUTPUT_CHARS - 320] + (
             "\n\n> [!NOTE]\n"
-            f"> *Output capped at {MAX_TOTAL_OUTPUT_CHARS:,} characters to protect LLM context window.*"
+            f"> *Output capped at {MAX_TOTAL_OUTPUT_CHARS:,} characters (truncated) to protect LLM context window.*"
         )
 
     est_tokens = int(len(full_output) / 4.2)

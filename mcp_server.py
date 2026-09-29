@@ -72,22 +72,24 @@ def search(query: str, max_results: int = 5, perspective: str = "tech") -> str:
         return "\n".join(out)
 
 @mcp.tool()
-def fetch(url: str, force_browser: bool = False, force_stealth: bool = False) -> str:
+def fetch(url: str, force_browser: bool = False, force_stealth: bool = False, skip_tls_verify: bool = True) -> str:
     """
-    Fetch the content of a webpage and convert it to clean, readable Markdown format.
+    Fetch the content of a webpage or PDF document and convert it to clean, readable Markdown format.
+    Automatically parses PDF documents, handles SSL certificates, and escalates to browser mode for dynamic pages.
     
     Args:
-        url: The web URL to fetch.
+        url: The web URL or PDF document link to fetch.
         force_browser: Set to True to use browser rendering for dynamic JavaScript pages.
         force_stealth: Legacy alias for force_browser.
+        skip_tls_verify: Set to True (default) to bypass invalid or self-signed TLS certificates (e.g. academic sites).
     """
     with _FETCH_SEMAPHORE:
         use_browser = force_browser or force_stealth
-        content = fetch_page(url, force_stealth=use_browser)
-        if len(content) > 20000:
-            content = content[:19500] + (
+        content = fetch_page(url, force_stealth=use_browser, skip_tls_verify=skip_tls_verify)
+        if len(content) > 25000:
+            content = content[:24600] + (
                 "\n\n> [!NOTE]\n"
-                f"> *Webpage content truncated at 20,000 characters (~4.8k tokens). Use `get_toc('{url}')` and `read_section` to read specific sections.*"
+                f"> *Webpage content capped at 25,000 characters (truncated). Use `get_toc('{url}')` and `read_section` to read specific sections.*"
             )
         return content
 
@@ -166,7 +168,10 @@ def batch_search(queries: list[str], max_results_per_query: int = 3, perspective
             )
             digest = format_fast_digest(data)
             outputs.append(f"## Batch Query [{idx}/{len(capped_queries)}]: `{q}`\n\n{digest}")
-    return "\n\n========================================\n\n".join(outputs)
+    res_str = "\n\n========================================\n\n".join(outputs)
+    if len(res_str) > 25000:
+        res_str = res_str[:24600] + "\n\n> [!NOTE]\n> *Batch output capped at 25,000 characters (truncated).*"
+    return res_str
 
 @mcp.tool()
 def deep_reasoning_search(query: str, reasoning_intent: str = "", num_pages: int = 3, perspective: str = "tech") -> str:

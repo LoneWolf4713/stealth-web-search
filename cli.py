@@ -56,14 +56,15 @@ def search(
 
 @app.command()
 def fetch(
-    url: str = typer.Argument(..., help="Webpage URL to fetch"),
+    url: str = typer.Argument(..., help="Webpage URL or PDF link to fetch"),
     force_stealth: bool = typer.Option(False, "--browser", "-b", help="Use browser rendering"),
     no_cache: bool = typer.Option(False, "--no-cache", help="Bypass SQLite cache"),
+    skip_tls_verify: bool = typer.Option(True, "--skip-tls-verify/--verify-tls", help="Bypass TLS certificate verification"),
     output_file: str = typer.Option("", "--out", "-o", help="Save markdown to file")
 ):
-    """Fetch any webpage and convert to Markdown format."""
+    """Fetch any webpage or PDF document and convert to Markdown format."""
     console.print(f"[dim]Fetching {url}...[/dim]")
-    content = fetch_page(url, force_stealth=force_stealth, use_cache=not no_cache)
+    content = fetch_page(url, force_stealth=force_stealth, use_cache=not no_cache, skip_tls_verify=skip_tls_verify)
     
     if output_file:
         with open(output_file, "w", encoding="utf-8") as f:
