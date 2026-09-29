@@ -234,6 +234,27 @@ def format_fast_digest(data: Dict[str, Any]) -> str:
                 lines.append(f"- [{r.get('title')}]({r.get('url')}): *{r.get('error_reason', 'Access blocked')}*")
         return "\n".join(lines)
 
+    # Extract Global Best Finding (Tavily/Perplexity-style Direct Answer)
+    best_passage = None
+    best_source = None
+    best_score = -999.0
+    for r in successful:
+        for p in r.get("top_passages", []):
+            score = p.get("relevance_score", 0.0)
+            if score > best_score:
+                best_score = score
+                best_passage = p
+                best_source = r
+
+    if best_passage and best_score > 0.0:
+        excerpt = best_passage.get("content", "").strip()
+        paragraphs = [p.strip() for p in excerpt.split("\n\n") if len(p.strip()) > 30]
+        lead_text = paragraphs[0] if paragraphs else excerpt
+        if len(lead_text) > 420:
+            lead_text = lead_text[:410] + "..."
+        lines.append(f"> 💡 **Top Finding / Key Evidence** ([{best_source.get('title')}]({best_source.get('url')})):")
+        lines.append(f"> {lead_text}\n")
+
     def render_entry(idx: int, r: Dict[str, Any]) -> str:
         out = [f"### {idx}. [{r.get('title')}]({r.get('url')})"]
         if r.get("snippet"):

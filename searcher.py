@@ -104,6 +104,23 @@ def _raw_search(
 
     return cleaned_results
 
+def clean_agent_query(query: str) -> str:
+    """
+    Cleans conversational agent queries into high-density search terms.
+    e.g. 'can you please search for opportunities for 3rd year btech' -> 'opportunities for 3rd year btech'
+    """
+    q = query.strip()
+    patterns = [
+        r'^(can you|could you|please)\s+(tell me|find|search|look up|show me|give me)?\s*(about|for)?\s*',
+        r'^(i want|i need|i am looking|i would like)\s+(to find|to search|to know|for)?\s*',
+        r'^(what is|what are|what were|tell me about|how to find)\s+',
+        r'^(find out|search for|look for)\s+',
+    ]
+    for p in patterns:
+        q = re.sub(p, '', q, flags=re.IGNORECASE).strip()
+    q = re.sub(r'[\?!.]+$', '', q).strip()
+    return q if len(q) >= 3 else query.strip()
+
 def search_web(
     query: str,
     max_results: int = 5,
@@ -119,9 +136,10 @@ def search_web(
     - 'dual': Executes concurrent parallel searches across both perspectives and tags results.
     """
     perspective = (perspective or "tech").lower()
+    q_clean = clean_agent_query(query)
 
     if perspective == "market":
-        market_query = f"{query} products software tools pricing alternatives"
+        market_query = f"{q_clean} products software tools pricing alternatives"
         results = _raw_search(market_query, max_results=max_results, region=region, timelimit=timelimit, use_cache=use_cache)
         for r in results:
             r["perspective"] = "market"
@@ -129,8 +147,8 @@ def search_web(
 
     if perspective == "dual":
         half = max(2, max_results // 2)
-        tech_q = f"{query} open source github architecture library"
-        market_q = f"{query} products tools software pricing"
+        tech_q = f"{q_clean} open source github architecture library"
+        market_q = f"{q_clean} products tools software pricing"
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             fut_tech = executor.submit(_raw_search, tech_q, half, region, timelimit, use_cache)
@@ -159,7 +177,7 @@ def search_web(
         return combined
 
     # Default 'tech' perspective
-    results = _raw_search(query, max_results=max_results, region=region, timelimit=timelimit, use_cache=use_cache)
+    results = _raw_search(q_clean, max_results=max_results, region=region, timelimit=timelimit, use_cache=use_cache)
     for r in results:
         r["perspective"] = "tech"
     return results

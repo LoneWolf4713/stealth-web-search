@@ -33,7 +33,7 @@ CLOUDFLARE_INDICATORS = [
 ]
 
 WALL_AND_BLOCK_PATTERNS = [
-    (re.compile(r"JavaScript is disabled|Please enable JavaScript|You need to enable JavaScript", re.I), "JavaScript required"),
+    (re.compile(r"JavaScript is disabled|Please enable JavaScript|You need to enable JavaScript|requires JavaScript|turn on JavaScript|enable JavaScript to run|unblock scripts", re.I), "JavaScript required"),
     (re.compile(r"Join for free to read|Sign in to ResearchGate|Log in to access|Sign in or create an account", re.I), "Login wall / Membership required"),
     (re.compile(r"Access Denied|403 Forbidden|Access to this page is restricted", re.I), "Access denied by host"),
     (re.compile(r"Subscribe to view|Purchase this article|Institutional access|Purchase PDF", re.I), "Paywall / Subscription required"),
