@@ -1,10 +1,13 @@
 """
 Markdown Chunker, Code-Block Preserver, and Table of Contents (TOC) Generator.
 - Protects code blocks (``` ... ```) so code syntax is never fragmented.
+- Guarantees strict chunk size limits (never allows huge chunks to overflow context).
 - Extracts clean Table of Contents outlines for progressive disclosure.
+- Deduplicates chunks to eliminate redundant boilerplate.
 - Allows targeted extraction of single sections by heading or index.
 """
 import re
+import hashlib
 from typing import List, Dict, Any, Optional
 
 HEADING_PATTERN = re.compile(r'^(#{1,6})\s+(.+)$', re.MULTILINE)
@@ -91,54 +94,163 @@ def extract_section(markdown: str, target: str) -> str:
     section_text = markdown[start_pos:end_pos].strip()
     return section_text
 
+def _synthesize_label(text: str, fallback_title: str = "Details") -> str:
+    """Extract a meaningful 3-6 word label from text if no heading is available."""
+    clean = re.sub(r'[#*`_\[\]()]+', ' ', text).strip()
+    first_line = clean.split('\n')[0].strip()
+    words = first_line.split()
+    if len(words) >= 3:
+        label = " ".join(words[:6])
+        if len(label) > 45:
+            label = label[:42] + "..."
+        return label
+    return fallback_title
+
+def _split_oversized_text(text: str, title: str, max_chunk_words: int, min_chunk_words: int) -> List[Dict[str, Any]]:
+    """Split oversized markdown into chunks, strictly preserving code blocks."""
+    # Find code blocks and placeholder them to avoid breaking code syntax
+    code_blocks = []
+    def save_code(m):
+        code_blocks.append(m.group(0))
+        return f"__CODE_BLOCK_SLOT_{len(code_blocks)-1}__"
+
+    masked = CODE_BLOCK_PATTERN.sub(save_code, text)
+    paragraphs = masked.split("\n\n")
+
+    chunks = []
+    current_chunk = []
+    current_words = 0
+
+    for p in paragraphs:
+        p_clean = p.strip()
+        if not p_clean:
+            continue
+
+        w = len(p_clean.split())
+        if current_words + w > max_chunk_words and current_chunk:
+            chunk_body = "\n\n".join(current_chunk)
+            # Restore code blocks
+            for idx, cb in enumerate(code_blocks):
+                chunk_body = chunk_body.replace(f"__CODE_BLOCK_SLOT_{idx}__", cb)
+            
+            # Hard character cap on any single chunk (never exceed 2,200 chars)
+            if len(chunk_body) > 2200:
+                chunk_body = chunk_body[:2150] + "\n[... Content truncated ...]"
+
+            chunks.append({
+                "heading": title,
+                "content": chunk_body.strip(),
+                "word_count": len(chunk_body.split())
+            })
+            current_chunk = [p_clean]
+            current_words = w
+        else:
+            current_chunk.append(p_clean)
+            current_words += w
+
+    if current_chunk:
+        chunk_body = "\n\n".join(current_chunk)
+        for idx, cb in enumerate(code_blocks):
+            chunk_body = chunk_body.replace(f"__CODE_BLOCK_SLOT_{idx}__", cb)
+        if len(chunk_body) > 2200:
+            chunk_body = chunk_body[:2150] + "\n[... Content truncated ...]"
+        if len(chunk_body.split()) >= min_chunk_words or not chunks:
+            chunks.append({
+                "heading": title,
+                "content": chunk_body.strip(),
+                "word_count": len(chunk_body.split())
+            })
+
+    return chunks
+
 def chunk_markdown_smart(
     markdown: str,
-    max_chunk_words: int = 400,
-    min_chunk_words: int = 30
+    max_chunk_words: int = 350,
+    min_chunk_words: int = 25
 ) -> List[Dict[str, Any]]:
     """
-    Chunks markdown while strictly preserving code blocks and heading hierarchy.
-    Returns: List of {"heading": str, "content": str, "word_count": int}
+    Smart semantic chunker with strict size enforcement:
+    1. Preserves code blocks (never splits inside ```).
+    2. Respects heading hierarchy.
+    3. RECURSIVELY divides oversized sections into sub-chunks.
+    4. Deduplicates duplicate/boilerplate passages.
+    5. Hard limit: no chunk exceeds 2,200 characters.
     """
+    if not markdown or len(markdown.strip()) < 50:
+        return []
+
     headings = extract_headings(markdown)
-    chunks = []
+    raw_chunks = []
 
     if not headings:
-        # Paragraph-based chunking with code block protection
+        # Paragraph-based chunking with dynamic heading labels
         paragraphs = markdown.split("\n\n")
         current_chunk = []
         current_words = 0
         for p in paragraphs:
-            w = len(p.split())
+            p_strip = p.strip()
+            if not p_strip:
+                continue
+            w = len(p_strip.split())
             if current_words + w > max_chunk_words and current_chunk:
-                chunks.append({
-                    "heading": "General",
-                    "content": "\n\n".join(current_chunk),
-                    "word_count": current_words
+                content_str = "\n\n".join(current_chunk)
+                label = _synthesize_label(content_str, "Overview")
+                if len(content_str) > 2200:
+                    content_str = content_str[:2150] + "\n[... Content truncated ...]"
+                raw_chunks.append({
+                    "heading": label,
+                    "content": content_str,
+                    "word_count": len(content_str.split())
                 })
-                current_chunk = [p]
+                current_chunk = [p_strip]
                 current_words = w
             else:
-                current_chunk.append(p)
+                current_chunk.append(p_strip)
                 current_words += w
+
         if current_chunk:
-            chunks.append({
-                "heading": "General",
-                "content": "\n\n".join(current_chunk),
-                "word_count": current_words
+            content_str = "\n\n".join(current_chunk)
+            label = _synthesize_label(content_str, "Overview")
+            if len(content_str) > 2200:
+                content_str = content_str[:2150] + "\n[... Content truncated ...]"
+            raw_chunks.append({
+                "heading": label,
+                "content": content_str,
+                "word_count": len(content_str.split())
             })
-        return chunks
+    else:
+        # Walk sections defined by headings
+        for i, h in enumerate(headings):
+            start = h["start"]
+            end = headings[i + 1]["start"] if i + 1 < len(headings) else len(markdown)
+            sec_text = markdown[start:end].strip()
+            w = len(sec_text.split())
 
-    for i, h in enumerate(headings):
-        start = h["start"]
-        end = headings[i + 1]["start"] if i + 1 < len(headings) else len(markdown)
-        sec_text = markdown[start:end].strip()
-        w = len(sec_text.split())
-        if w >= min_chunk_words:
-            chunks.append({
-                "heading": h["title"],
-                "content": sec_text,
-                "word_count": w
-            })
+            if w <= max_chunk_words:
+                if w >= min_chunk_words:
+                    if len(sec_text) > 2200:
+                        sec_text = sec_text[:2150] + "\n[... Content truncated ...]"
+                    raw_chunks.append({
+                        "heading": h["title"],
+                        "content": sec_text,
+                        "word_count": len(sec_text.split())
+                    })
+            else:
+                # Subdivide oversized section
+                sub_chunks = _split_oversized_text(sec_text, h["title"], max_chunk_words, min_chunk_words)
+                raw_chunks.extend(sub_chunks)
 
-    return chunks
+    # Deduplicate chunks based on text hash
+    seen_hashes = set()
+    deduped_chunks = []
+    for c in raw_chunks:
+        norm = re.sub(r'\s+', ' ', c["content"]).strip().lower()
+        if len(norm) < 40:
+            continue
+        h = hashlib.md5(norm[:300].encode('utf-8')).hexdigest()
+        if h in seen_hashes:
+            continue
+        seen_hashes.add(h)
+        deduped_chunks.append(c)
+
+    return deduped_chunks

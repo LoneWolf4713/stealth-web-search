@@ -1,11 +1,12 @@
 """
 Fast Neural Acceleration Module (CUDA / CPU auto-sensing).
-- GLiNER: Zero-shot arbitrary entity extraction (< 10ms on GPU, ~25ms on CPU).
-- Cross-Encoder: Instruction-aware semantic reranker (< 30ms on GPU, ~80ms on CPU).
+- GLiNER: Zero-shot arbitrary entity extraction with case-insensitive deduplication and confidence thresholding.
+- Cross-Encoder: Calibrated semantic reranker with normalized percentage match scores.
 - Automatic hardware fallback: CUDA if GPU is enabled, otherwise multicore CPU.
 """
 import os
 import sys
+import math
 import logging
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -24,6 +25,13 @@ def get_device() -> str:
     except Exception:
         pass
     return "cpu"
+
+def sigmoid(val: float) -> float:
+    """Standard logistic sigmoid function."""
+    try:
+        return 1.0 / (1.0 + math.exp(-val))
+    except OverflowError:
+        return 0.0 if val < 0 else 1.0
 
 # --- 1. GLiNER: Zero-Shot Entity Extractor ---
 def load_gliner(model_name: str = "urchade/gliner_small-v2.1"):
@@ -44,36 +52,53 @@ def load_gliner(model_name: str = "urchade/gliner_small-v2.1"):
 def extract_entities(
     text: str,
     labels: Optional[List[str]] = None,
-    threshold: float = 0.3
+    threshold: float = 0.55
 ) -> List[Dict[str, Any]]:
     """
-    Extracts arbitrary entity types on the fly without rigid NER schemas.
-    Defaults to discovery labels: hackathons, grants, libraries, tools, events, etc.
+    Extracts arbitrary entity types with case-insensitive deduplication and confidence cutoff.
+    Avoids extracting noisy boilerplate or repeated tokens.
     """
+    if not text or len(text.strip()) < 50:
+        return []
+
     if not labels:
         labels = [
+            "technology", "framework", "library", "tool",
             "hackathon", "grant", "fellowship", "competition",
-            "technology", "framework", "library", "event",
-            "deadline", "prize"
+            "company", "organization", "deadline", "prize"
         ]
 
     model = load_gliner()
     if model is None:
-        # Graceful fallback: return empty list if model not available
         return []
 
     try:
-        # Truncate text to reasonable max length for encoder if needed
-        truncated_text = text[:4000]
+        truncated_text = text[:3500]
         entities = model.predict_entities(truncated_text, labels, threshold=threshold)
-        return [
-            {
-                "entity": ent["text"],
-                "label": ent["label"],
-                "score": round(float(ent["score"]), 3)
-            }
-            for ent in entities
-        ]
+        
+        # Sort by confidence score descending and deduplicate case-insensitively
+        sorted_raw = sorted(entities, key=lambda x: x.get("score", 0), reverse=True)
+        seen = set()
+        unique_entities = []
+
+        for ent in sorted_raw:
+            clean_name = ent.get("text", "").strip()
+            norm = clean_name.lower()
+            if len(clean_name) < 2 or norm in seen:
+                continue
+            # Filter out numbers-only or common false positives
+            if norm in ("javascript", "browser", "cookies", "please enable", "click here", "read more"):
+                continue
+            seen.add(norm)
+            unique_entities.append({
+                "entity": clean_name,
+                "label": ent.get("label", "entity"),
+                "score": round(float(ent.get("score", 0)), 2)
+            })
+            if len(unique_entities) >= 6:
+                break
+
+        return unique_entities
     except Exception as e:
         logger.warning(f"GLiNER inference error: {e}")
         return []
@@ -103,25 +128,40 @@ def rerank_chunks(
     query: str,
     chunks: List[Dict[str, Any]],
     instruction: Optional[str] = None,
-    top_k: int = 5
+    top_k: int = 3
 ) -> List[Dict[str, Any]]:
     """
     Joint cross-attention scoring between (Query + Instruction) and Document chunks.
-    Preserves all chunks if scoring is not available.
+    Deduplicates identical chunks, normalizes scores to human/LLM-readable percentages,
+    and caps individual passage lengths.
     """
     if not chunks:
         return []
 
+    # Deduplicate chunks based on normalized leading text
+    seen_texts = set()
+    deduped_chunks = []
+    for c in chunks:
+        content = c.get("content", "").strip()
+        key = content[:150].lower()
+        if key in seen_texts:
+            continue
+        seen_texts.add(key)
+        deduped_chunks.append(c)
+
     model, tokenizer = load_reranker()
     if model is None or tokenizer is None:
-        # Fallback: return top_k un-ranked chunks
-        return chunks[:top_k]
+        for c in deduped_chunks[:top_k]:
+            c["match_pct"] = "N/A"
+            if len(c["content"]) > 1500:
+                c["content"] = c["content"][:1450] + "\n[... Passage truncated ...]"
+        return deduped_chunks[:top_k]
 
     import torch
     device = get_device()
 
     full_query = f"{instruction} Query: {query}" if instruction else query
-    pairs = [(full_query, c.get("content", "")) for c in chunks]
+    pairs = [(full_query, c.get("content", "")) for c in deduped_chunks]
 
     try:
         features = tokenizer(
@@ -140,16 +180,30 @@ def rerank_chunks(
         if isinstance(scores, float):
             scores = [scores]
 
-        # Attach scores to chunks
+        # Attach raw score and calibrated percentage match
         for idx, score in enumerate(scores):
-            chunks[idx]["relevance_score"] = round(float(score), 4)
+            raw_val = float(score)
+            deduped_chunks[idx]["relevance_score"] = raw_val
+            pct = int(round(sigmoid(raw_val) * 100))
+            deduped_chunks[idx]["match_pct"] = f"{pct}% Match"
 
-        # Sort descending by relevance score
-        sorted_chunks = sorted(chunks, key=lambda x: x.get("relevance_score", 0), reverse=True)
-        return sorted_chunks[:top_k]
+        # Sort descending by raw score
+        sorted_chunks = sorted(deduped_chunks, key=lambda x: x.get("relevance_score", 0), reverse=True)
+        top_chunks = sorted_chunks[:top_k]
+
+        # Per-passage length safety cap (never exceed 1,500 characters per passage)
+        for c in top_chunks:
+            if len(c["content"]) > 1500:
+                c["content"] = c["content"][:1450] + "\n[... Passage truncated ...]"
+
+        return top_chunks
     except Exception as e:
         logger.warning(f"Reranking error: {e}")
-        return chunks[:top_k]
+        for c in deduped_chunks[:top_k]:
+            c["match_pct"] = "N/A"
+            if len(c["content"]) > 1500:
+                c["content"] = c["content"][:1450] + "\n[... Passage truncated ...]"
+        return deduped_chunks[:top_k]
 
 if __name__ == "__main__":
     dev = get_device()

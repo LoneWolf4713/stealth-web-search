@@ -95,6 +95,14 @@ Synthesizes comprehensive research across pages using local model reasoning:
 
 ---
 
+### 6. Batch Search
+Run multiple queries in a safe, sequential batch:
+```bash
+./run_tool.sh batch "rust async runtime comparison" "tokio vs smol benchmarks" --num 2
+```
+
+---
+
 ## MCP Server Setup
 
 The tool includes a built-in MCP server (`mcp_server.py`) that lets AI coding assistants search and browse the web directly.
@@ -118,15 +126,17 @@ Add this to your `~/.claude.json` or desktop configuration:
 | Tool Name | Purpose | Parameters |
 |---|---|---|
 | `search` | Quick web search with summaries | `query` (str), `max_results` (int), `perspective` ('tech'/'market'/'dual') |
-| `fetch` | Fetch page content as Markdown | `url` (str), `force_browser` (bool) |
-| `get_toc` | View document table of contents | `url` (str) |
-| `read_section` | Read a specific section of a document | `url` (str), `section_name_or_index` (str) |
+| `fetch` | Fetch page content as Markdown (capped at 20k chars) | `url` (str), `force_browser` (bool) |
+| `get_toc` | View document table of contents (~150 tokens) | `url` (str) |
+| `read_section` | Read a specific section of a document (~400 tokens) | `url` (str), `section_name_or_index` (str) |
 | `fast_neural_search` | Multi-source search with passage ranking | `query` (str), `instruction` (str), `num_pages` (int), `perspective` |
+| `batch_search` | Safe sequential multi-query batch search | `queries` (list[str]), `max_results_per_query` (int), `perspective` |
 | `deep_reasoning_search` | In-depth synthesized research | `query` (str), `reasoning_intent` (str), `num_pages` (int), `perspective` |
 
 ### Best Practices for AI Agents
-- **Sequential Execution**: Agents should invoke tools sequentially rather than firing multiple searches in parallel in a single turn. The server includes automatic hardware semaphores to queue simultaneous requests and protect system memory.
-- **Progressive Depth**: Use `search` for fast single lookups, `fast_neural_search` (< 1s) for multi-source passage extraction, and `deep_reasoning_search` for complex cross-document deduction.
+- **Token Safety & Bounded Output**: All responses report estimated token and character counts in the header. Responses are strictly capped to ~24,000 characters (~5k tokens) to prevent context overflow.
+- **Clean Source Isolation**: Inaccessible or blocked pages (such as login walls or invalid certs) are cleanly separated into a footer section so failed fetches never masquerade as content.
+- **Batch Searches**: When investigating multiple related topics, use `batch_search` instead of firing parallel tool calls in a single turn. Hardware semaphores serialize model runs to protect host memory.
 
 ---
 

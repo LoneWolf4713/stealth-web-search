@@ -1,28 +1,29 @@
 """
 Parallel Search & Intelligent Retrieval Engine.
 - Multi-core concurrent fetching with SQLite caching & Cloudflare cookie vault.
-- Code-block preserving chunker (never splits ``` code blocks).
-- Fast Neural Reranking via Cross-Encoder (CUDA / CPU auto-sensing).
-- Zero-Shot Entity Extraction via GLiNER.
+- Code-block preserving chunker with recursive sub-chunking & deduplication.
+- Fast Neural Reranking via Cross-Encoder (calibrated percentage match).
+- Zero-Shot Entity Extraction via GLiNER with confidence thresholding.
+- Strict response character ceiling (24k chars) to prevent context token overflow.
+- Clean source partitioning: failed/blocked sources moved to compact footer.
 """
 import os
 import sys
 import json
 import time
+import fcntl
+import gc
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import gc
-
 from searcher import search_web, search_news
-from fetcher import fetch_page
+from fetcher import fetch_page_detailed
 from chunker import chunk_markdown_smart, get_table_of_contents, extract_section
 from neural_fast import rerank_chunks, extract_entities, get_device
 
-import fcntl
-
-# Throttled worker count to prevent WSL memory exhaustion
+# Throttled worker count to prevent memory exhaustion in constrained (WSL) environments
 DEFAULT_WORKERS = min(3, os.cpu_count() or 2)
+MAX_TOTAL_OUTPUT_CHARS = 24000  # Hard ceiling (~5,000 tokens)
 
 class MLHardwareLock:
     """Cross-process lock to prevent concurrent ML model runs from exceeding system RAM/VRAM."""
@@ -75,31 +76,54 @@ def process_single_url(
             "snippet": snippet,
             "top_passages": [],
             "entities": [],
-            "status": "missing_url"
+            "status": "failed",
+            "error_reason": "Missing URL"
         }
 
     try:
-        content = fetch_page(url)
-        if not content or len(content.strip()) < 50:
+        fetch_res = fetch_page_detailed(url)
+        if not fetch_res.get("success", False):
             return {
                 "title": title,
                 "url": url,
                 "snippet": snippet,
                 "top_passages": [],
                 "entities": [],
-                "status": "empty_content"
+                "status": "failed",
+                "error_reason": fetch_res.get("error_reason", "Access restricted / blocked")
             }
 
-        # 1. Code-block preserving semantic chunking
-        raw_chunks = chunk_markdown_smart(content, max_chunk_words=450)
+        content = fetch_res.get("content", "")
+        if not content or len(content.strip()) < 80:
+            return {
+                "title": title,
+                "url": url,
+                "snippet": snippet,
+                "top_passages": [],
+                "entities": [],
+                "status": "failed",
+                "error_reason": "Page loaded but main content was empty or unparseable"
+            }
 
-        # 2. Neural Cross-Encoder Reranker (CUDA/CPU)
+        # 1. Code-block preserving semantic chunking with recursive sub-chunking
+        raw_chunks = chunk_markdown_smart(content, max_chunk_words=350)
+        if not raw_chunks:
+            return {
+                "title": title,
+                "url": url,
+                "snippet": snippet,
+                "top_passages": [],
+                "entities": [],
+                "status": "failed",
+                "error_reason": "No text sections could be extracted"
+            }
+
+        # 2. Neural Cross-Encoder Reranker (calibrated percentage match)
         ranked = rerank_chunks(query, raw_chunks, instruction=instruction, top_k=top_chunks_per_page)
 
-        # 3. GLiNER Entity Extraction
+        # 3. GLiNER Entity Extraction (only on top ranked passages)
         entities = []
-        if extract_ner:
-            # Extract entities from the top ranked passages
+        if extract_ner and ranked:
             combined_top = "\n".join([c.get("content", "") for c in ranked])
             entities = extract_entities(combined_top)
 
@@ -109,7 +133,8 @@ def process_single_url(
             "snippet": snippet,
             "top_passages": ranked,
             "entities": entities,
-            "status": "success"
+            "status": "success",
+            "error_reason": None
         }
     except Exception as e:
         return {
@@ -118,7 +143,8 @@ def process_single_url(
             "snippet": snippet,
             "top_passages": [],
             "entities": [],
-            "status": f"error: {str(e)}"
+            "status": "failed",
+            "error_reason": f"Processing error: {str(e)[:80]}"
         }
 
 def fast_intelligent_search(
@@ -132,8 +158,8 @@ def fast_intelligent_search(
 ) -> Dict[str, Any]:
     """
     End-to-End Fast Neural Search with Perspective Routing (tech, market, dual):
-    1. Keyless search with SQLite cache.
-    2. Parallel multi-threaded stealth fetch.
+    1. Keyless search with SQLite cache and URL deduplication.
+    2. Parallel multi-threaded fetch with SSL fallback and content classification.
     3. Neural chunk reranking + GLiNER entity extraction.
     """
     t0 = time.perf_counter()
@@ -183,51 +209,96 @@ def fast_intelligent_search(
     }
 
 def format_fast_digest(data: Dict[str, Any]) -> str:
-    """Format intelligent research results into token-dense, zero-loss Markdown with perspective grouping."""
+    """Format intelligent research results into token-dense Markdown with size ceiling & source partitioning."""
     perspective = data.get("perspective", "tech")
+    results = data.get("results", [])
+    elapsed = data.get("elapsed_seconds", 0)
+    device = data.get("device", "cpu").upper()
+
+    successful = [r for r in results if r.get("status") == "success" and r.get("top_passages")]
+    failed = [r for r in results if r.get("status") != "success" or not r.get("top_passages")]
+
     lines = [
-        f"# Intelligent Research Digest: `{data.get('query')}`",
-        f"*Perspective: {perspective.upper()} | Processed in {data.get('elapsed_seconds')}s on {data.get('device', 'cpu').upper()} using {data.get('workers_used')} threads*\n"
+        f"# Research Digest: `{data.get('query')}`",
+        f"*Perspective: {perspective.upper()} | Sources: {len(successful)}/{len(results)} accessible | Time: {elapsed}s on {device}*\n"
     ]
 
-    results = data.get("results", [])
+    # If completely 100% of sources failed, report clear notice
+    if not successful:
+        lines.append("> [!WARNING]")
+        lines.append(f"> **All {len(results)} sources were inaccessible or blocked** (paywalls, login walls, or network errors). No usable content could be extracted.")
+        lines.append("")
+        if failed:
+            lines.append("### Failed / Inaccessible Sources:")
+            for r in failed:
+                lines.append(f"- [{r.get('title')}]({r.get('url')}): *{r.get('error_reason', 'Access blocked')}*")
+        return "\n".join(lines)
 
-    def render_entry(idx: int, r: Dict[str, Any]):
+    def render_entry(idx: int, r: Dict[str, Any]) -> str:
         out = [f"### {idx}. [{r.get('title')}]({r.get('url')})"]
-        out.append(f"**Snippet**: {r.get('snippet')}\n")
+        if r.get("snippet"):
+            out.append(f"**Overview**: {r.get('snippet')}\n")
+        
         entities = r.get("entities", [])
         if entities:
-            ent_str = ", ".join([f"`{e['entity']}` *({e['label']})*" for e in entities[:8]])
-            out.append(f"**Identified Entities**: {ent_str}\n")
+            ent_str = ", ".join([f"`{e['entity']}` *({e['label']})*" for e in entities[:6]])
+            out.append(f"**Key Entities**: {ent_str}\n")
+
         passages = r.get("top_passages", [])
         if passages:
-            out.append("#### Key Passages & Solutions:")
+            out.append("#### Top Relevant Passages:")
             for p in passages:
-                score_str = f" [Relevance: {p.get('relevance_score')}]" if "relevance_score" in p else ""
-                out.append(f"##### Section: {p.get('heading', 'Details')}{score_str}")
+                match_str = f" [{p.get('match_pct', '')}]" if p.get('match_pct') else ""
+                heading = p.get('heading', 'Details')
+                out.append(f"##### Section: {heading}{match_str}")
                 out.append(p.get("content", "").strip())
                 out.append("")
-        else:
-            out.append("*(No passages extracted)*\n")
         out.append("\n---\n")
         return "\n".join(out)
 
     if perspective == "dual":
-        tech_items = [r for r in results if r.get("perspective") == "tech"]
-        market_items = [r for r in results if r.get("perspective") == "market"]
+        tech_items = [r for r in successful if r.get("perspective") == "tech"]
+        market_items = [r for r in successful if r.get("perspective") == "market"]
 
-        lines.append("## 💻 Open-Source & Technical Architecture Ground Truth\n")
-        for idx, r in enumerate(tech_items, 1):
-            lines.append(render_entry(idx, r))
+        if tech_items:
+            lines.append("## 💻 Open-Source & Technical Architecture\n")
+            for idx, r in enumerate(tech_items, 1):
+                lines.append(render_entry(idx, r))
 
-        lines.append("\n## 🏢 Commercial & Startup Market Landscape\n")
-        for idx, r in enumerate(market_items, 1):
-            lines.append(render_entry(idx, r))
+        if market_items:
+            lines.append("\n## 🏢 Commercial & Product Landscape\n")
+            for idx, r in enumerate(market_items, 1):
+                lines.append(render_entry(idx, r))
     else:
-        for idx, r in enumerate(results, 1):
+        for idx, r in enumerate(successful, 1):
             lines.append(render_entry(idx, r))
 
-    return "\n".join(lines)
+    # Append failed sources in a clean, small footer
+    if failed:
+        lines.append("\n### ⚠️ Inaccessible / Blocked Sources:")
+        for r in failed:
+            lines.append(f"- [{r.get('title')}]({r.get('url')}): *{r.get('error_reason', 'Access blocked')}*")
+        lines.append("")
+
+    full_output = "\n".join(lines)
+
+    # Enforce strict response character ceiling
+    if len(full_output) > MAX_TOTAL_OUTPUT_CHARS:
+        full_output = full_output[:MAX_TOTAL_OUTPUT_CHARS - 300] + (
+            "\n\n> [!NOTE]\n"
+            f"> *Output capped at {MAX_TOTAL_OUTPUT_CHARS:,} characters to protect LLM context window. Showing most relevant passages.*"
+        )
+
+    # Estimate token count (chars / 4.2 approx) and prepend to metrics
+    est_tokens = int(len(full_output) / 4.2)
+    meta_line = f"*Tokens: ~{est_tokens:,} | Chars: {len(full_output):,} | Perspective: {perspective.upper()} | Time: {elapsed}s on {device}*\n"
+    # Replace second line with updated token count
+    lines_split = full_output.split("\n")
+    if len(lines_split) > 1:
+        lines_split[1] = meta_line
+        full_output = "\n".join(lines_split)
+
+    return full_output
 
 def deep_reasoning_search(
     query: str,
@@ -238,8 +309,8 @@ def deep_reasoning_search(
 ) -> Dict[str, Any]:
     """
     Phase 2 Deep Reasoning Search:
-    Executes search -> parallel crawls -> uses local quantized Gemma 2 2B SLM
-    to extract deep semantic intelligence, obscure entities, and solutions.
+    Executes search -> fetches pages -> runs local quantized Gemma 2 2B SLM
+    strictly on ACCESSIBLE pages to extract deep semantic intelligence.
     """
     t0 = time.perf_counter()
     from deep_reasoner import extract_deep_intelligence
@@ -258,7 +329,7 @@ def deep_reasoning_search(
     with MLHardwareLock():
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_item = {
-                executor.submit(fetch_page, item.get("href", "")): item
+                executor.submit(fetch_page_detailed, item.get("href", "")): item
                 for item in search_results
                 if item.get("href")
             }
@@ -266,25 +337,56 @@ def deep_reasoning_search(
                 item = future_to_item[future]
                 url = item.get("href", "")
                 title = item.get("title", "")
+                perspective_tag = item.get("perspective", "tech")
+                snippet = item.get("body", "")
+
                 try:
-                    content = future.result()
+                    fetch_res = future.result()
+                    if not fetch_res.get("success", False):
+                        detailed_results.append({
+                            "title": title,
+                            "url": url,
+                            "perspective": perspective_tag,
+                            "snippet": snippet,
+                            "extracted_intelligence": "",
+                            "status": "failed",
+                            "error_reason": fetch_res.get("error_reason", "Access restricted / blocked")
+                        })
+                        continue
+
+                    content = fetch_res.get("content", "")
+                    if not content or len(content.strip()) < 80:
+                        detailed_results.append({
+                            "title": title,
+                            "url": url,
+                            "perspective": perspective_tag,
+                            "snippet": snippet,
+                            "extracted_intelligence": "",
+                            "status": "failed",
+                            "error_reason": "Page content was empty or unparseable"
+                        })
+                        continue
+
+                    # Only run SLM reasoning on accessible, real content
                     intelligence = extract_deep_intelligence(content, query, reasoning_intent)
                     detailed_results.append({
                         "title": title,
                         "url": url,
-                        "perspective": item.get("perspective", "tech"),
-                        "snippet": item.get("body", ""),
+                        "perspective": perspective_tag,
+                        "snippet": snippet,
                         "extracted_intelligence": intelligence,
-                        "status": "success"
+                        "status": "success",
+                        "error_reason": None
                     })
                 except Exception as e:
                     detailed_results.append({
                         "title": title,
                         "url": url,
-                        "perspective": item.get("perspective", "tech"),
-                        "snippet": item.get("body", ""),
-                        "extracted_intelligence": f"Error during reasoning: {str(e)}",
-                        "status": "error"
+                        "perspective": perspective_tag,
+                        "snippet": snippet,
+                        "extracted_intelligence": "",
+                        "status": "failed",
+                        "error_reason": f"Reasoning error: {str(e)[:80]}"
                     })
 
         elapsed = round(time.perf_counter() - t0, 3)
@@ -300,39 +402,81 @@ def deep_reasoning_search(
     }
 
 def format_deep_digest(data: Dict[str, Any]) -> str:
-    """Format deep reasoning results into clean, high-utility Markdown with perspective grouping."""
+    """Format deep reasoning results into clean Markdown with size ceiling & source partitioning."""
     perspective = data.get("perspective", "tech")
+    results = data.get("results", [])
+    elapsed = data.get("elapsed_seconds", 0)
+
+    successful = [r for r in results if r.get("status") == "success" and r.get("extracted_intelligence")]
+    failed = [r for r in results if r.get("status") != "success" or not r.get("extracted_intelligence")]
+
     lines = [
-        f"# Deep Reasoning Intelligence Digest: `{data.get('query')}`",
-        f"*Perspective: {perspective.upper()} | Extracted using Local Gemma 2 SLM in {data.get('elapsed_seconds')}s across {data.get('total_results', 0)} sources*\n"
+        f"# Deep Reasoning Intelligence: `{data.get('query')}`",
+        f"*Perspective: {perspective.upper()} | Sources: {len(successful)}/{len(results)} accessible | Time: {elapsed}s on GPU*\n"
     ]
 
-    results = data.get("results", [])
+    if not successful:
+        lines.append("> [!WARNING]")
+        lines.append(f"> **All {len(results)} sources were inaccessible or blocked**. No intelligence could be extracted.")
+        lines.append("")
+        if failed:
+            lines.append("### Failed / Inaccessible Sources:")
+            for r in failed:
+                lines.append(f"- [{r.get('title')}]({r.get('url')}): *{r.get('error_reason', 'Access blocked')}*")
+        return "\n".join(lines)
 
-    def render_entry(idx: int, r: Dict[str, Any]):
+    def render_entry(idx: int, r: Dict[str, Any]) -> str:
         out = [f"### {idx}. [{r.get('title')}]({r.get('url')})"]
-        out.append(f"**Source Summary**: {r.get('snippet')}\n")
-        out.append("#### Extracted Intelligence & Actionable Details:")
-        out.append(r.get("extracted_intelligence", "No intelligence extracted."))
+        if r.get("snippet"):
+            out.append(f"**Overview**: {r.get('snippet')}\n")
+        out.append("#### Extracted Intelligence & Details:")
+        intel = r.get("extracted_intelligence", "").strip()
+        # Per-source length safety cap
+        if len(intel) > 2500:
+            intel = intel[:2450] + "\n[... Intelligence truncated ...]"
+        out.append(intel)
         out.append("\n---\n")
         return "\n".join(out)
 
     if perspective == "dual":
-        tech_items = [r for r in results if r.get("perspective") == "tech"]
-        market_items = [r for r in results if r.get("perspective") == "market"]
+        tech_items = [r for r in successful if r.get("perspective") == "tech"]
+        market_items = [r for r in successful if r.get("perspective") == "market"]
 
-        lines.append("## 💻 Open-Source & Technical Architecture Ground Truth\n")
-        for idx, r in enumerate(tech_items, 1):
-            lines.append(render_entry(idx, r))
+        if tech_items:
+            lines.append("## 💻 Open-Source & Technical Architecture\n")
+            for idx, r in enumerate(tech_items, 1):
+                lines.append(render_entry(idx, r))
 
-        lines.append("\n## 🏢 Commercial & Startup Market Landscape\n")
-        for idx, r in enumerate(market_items, 1):
-            lines.append(render_entry(idx, r))
+        if market_items:
+            lines.append("\n## 🏢 Commercial & Product Landscape\n")
+            for idx, r in enumerate(market_items, 1):
+                lines.append(render_entry(idx, r))
     else:
-        for idx, r in enumerate(results, 1):
+        for idx, r in enumerate(successful, 1):
             lines.append(render_entry(idx, r))
 
-    return "\n".join(lines)
+    if failed:
+        lines.append("\n### ⚠️ Inaccessible / Blocked Sources:")
+        for r in failed:
+            lines.append(f"- [{r.get('title')}]({r.get('url')}): *{r.get('error_reason', 'Access blocked')}*")
+        lines.append("")
+
+    full_output = "\n".join(lines)
+
+    if len(full_output) > MAX_TOTAL_OUTPUT_CHARS:
+        full_output = full_output[:MAX_TOTAL_OUTPUT_CHARS - 300] + (
+            "\n\n> [!NOTE]\n"
+            f"> *Output capped at {MAX_TOTAL_OUTPUT_CHARS:,} characters to protect LLM context window.*"
+        )
+
+    est_tokens = int(len(full_output) / 4.2)
+    meta_line = f"*Tokens: ~{est_tokens:,} | Chars: {len(full_output):,} | Perspective: {perspective.upper()} | Time: {elapsed}s on GPU*\n"
+    lines_split = full_output.split("\n")
+    if len(lines_split) > 1:
+        lines_split[1] = meta_line
+        full_output = "\n".join(lines_split)
+
+    return full_output
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
@@ -342,4 +486,3 @@ if __name__ == "__main__":
     n = int(sys.argv[2]) if len(sys.argv) > 2 else 3
     res = fast_intelligent_search(q, max_results=n)
     print(format_fast_digest(res))
-

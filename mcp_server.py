@@ -74,7 +74,13 @@ def fetch(url: str, force_browser: bool = False, force_stealth: bool = False) ->
     """
     with _FETCH_SEMAPHORE:
         use_browser = force_browser or force_stealth
-        return fetch_page(url, force_stealth=use_browser)
+        content = fetch_page(url, force_stealth=use_browser)
+        if len(content) > 20000:
+            content = content[:19500] + (
+                "\n\n> [!NOTE]\n"
+                f"> *Webpage content truncated at 20,000 characters (~4.8k tokens). Use `get_toc('{url}')` and `read_section` to read specific sections.*"
+            )
+        return content
 
 @mcp.tool()
 def get_toc(url: str) -> str:
@@ -126,6 +132,32 @@ def fast_neural_search(query: str, instruction: str = "", num_pages: int = 4, pe
             instruction=instruction if instruction else None
         )
         return format_fast_digest(data)
+
+@mcp.tool()
+def batch_search(queries: list[str], max_results_per_query: int = 3, perspective: str = "tech") -> str:
+    """
+    Execute multiple search queries in a safe, sequential batch.
+    Use this when you need answers for 2 or more related questions without making separate parallel tool calls.
+    
+    Args:
+        queries: List of search query strings (max 3 queries per batch).
+        max_results_per_query: Number of pages per query (default: 3).
+        perspective: 'tech' (default), 'market', or 'dual'.
+    """
+    if not queries:
+        return "No queries provided."
+    capped_queries = queries[:3]
+    outputs = []
+    for idx, q in enumerate(capped_queries, 1):
+        with _ML_SEMAPHORE:
+            data = fast_intelligent_search(
+                q,
+                max_results=max_results_per_query,
+                perspective=perspective
+            )
+            digest = format_fast_digest(data)
+            outputs.append(f"## Batch Query [{idx}/{len(capped_queries)}]: `{q}`\n\n{digest}")
+    return "\n\n========================================\n\n".join(outputs)
 
 @mcp.tool()
 def deep_reasoning_search(query: str, reasoning_intent: str = "", num_pages: int = 3, perspective: str = "tech") -> str:

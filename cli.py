@@ -122,10 +122,19 @@ def deep(
         reasoning_intent=intent or None,
         max_results=max_results
     )
-    if json_output:
-        print(json.dumps(data, indent=2))
-    else:
-        print(format_deep_digest(data))
+@app.command()
+def batch(
+    queries: list[str] = typer.Argument(..., help="Search queries to execute in batch"),
+    perspective: str = typer.Option("tech", "--perspective", "-p", help="Perspective: tech (open-source), market (commercial), or dual (both)"),
+    max_results: int = typer.Option(3, "--num", "-n", help="Number of pages per query")
+):
+    """Execute multiple search queries in a safe, sequential batch."""
+    for idx, q in enumerate(queries, 1):
+        console.print(f"[bold cyan]Batch Query [{idx}/{len(queries)}]: '{q}'[/bold cyan]")
+        data = fast_intelligent_search(q, max_results=max_results, perspective=perspective)
+        print(format_fast_digest(data))
+        if idx < len(queries):
+            print("\n" + "=" * 50 + "\n")
 
 if __name__ == "__main__":
     app()
