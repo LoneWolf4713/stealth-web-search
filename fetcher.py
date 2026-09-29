@@ -344,7 +344,7 @@ def fetch_page_detailed(
     """
     if use_cache and not force_stealth:
         cached = get_cached_page(url)
-        if cached:
+        if cached and not cached.startswith("%PDF"):
             return {
                 "success": True,
                 "content": cached,

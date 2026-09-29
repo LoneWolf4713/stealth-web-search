@@ -108,13 +108,18 @@ def get_cached_page(url: str, max_age_hours: float = 48.0) -> Optional[str]:
             if row:
                 content, created_at, ttl = row
                 if (now - created_at) < min(ttl, max_age_hours * 3600):
+                    # Invalidate stale raw PDF binary entries saved before PDF parser was added
+                    if content and (content.startswith("%PDF-") or content.startswith("%PDF")):
+                        conn.execute("DELETE FROM page_cache WHERE url_hash = ?", (u_hash,))
+                        conn.commit()
+                        return None
                     return content
     except Exception:
         pass
     return None
 
 def set_cached_page(url: str, content: str, ttl_hours: float = 48.0):
-    if not content or len(content.strip()) < 50:
+    if not content or len(content.strip()) < 50 or content.startswith("%PDF-") or content.startswith("%PDF"):
         return
     u_hash = _hash(url)
     now = time.time()
