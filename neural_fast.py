@@ -8,7 +8,17 @@ import os
 import sys
 import math
 import logging
+import warnings
 from typing import List, Dict, Any, Optional, Tuple
+
+# Suppress progress bars and library warnings for clean CLI/MCP output
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+logging.getLogger("gliner").setLevel(logging.ERROR)
 
 logger = logging.getLogger("neural_fast")
 
@@ -189,7 +199,16 @@ def rerank_chunks(
 
         # Sort descending by raw score
         sorted_chunks = sorted(deduped_chunks, key=lambda x: x.get("relevance_score", 0), reverse=True)
-        top_chunks = sorted_chunks[:top_k]
+        
+        # Filter out low-relevance noise:
+        # Keep passages with >= 12% match. If no passages meet 12%, keep only the single top passage as fallback.
+        top_chunks = []
+        for idx, c in enumerate(sorted_chunks[:top_k]):
+            pct = int(round(sigmoid(c.get("relevance_score", -99)) * 100))
+            if pct >= 12:
+                top_chunks.append(c)
+            elif idx == 0:
+                top_chunks.append(c)
 
         # Per-passage length safety cap (never exceed 1,500 characters per passage)
         for c in top_chunks:

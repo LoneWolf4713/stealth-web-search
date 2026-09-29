@@ -2,8 +2,19 @@
 """
 CLI entry point for web search and information retrieval.
 """
+import os
 import sys
 import json
+import warnings
+import logging
+
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+warnings.filterwarnings("ignore")
+logging.getLogger("transformers").setLevel(logging.ERROR)
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+logging.getLogger("gliner").setLevel(logging.ERROR)
+
 import typer
 from rich.console import Console
 from rich.table import Table
