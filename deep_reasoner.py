@@ -1,6 +1,6 @@
 """
 Deep Reasoning & SLM Extraction Engine (Phase 2).
-Uses quantized Gemma 2 (2B-IT) in GGUF format via llama-cpp (CUDA / CPU auto-sensing).
+Uses quantized Gemma 4 (E2B-IT) in GGUF format via llama-cpp (CUDA / CPU auto-sensing).
 Performs goal-directed semantic extraction over broad, vague, or complex queries
 without information loss or hallucination.
 """
@@ -12,7 +12,15 @@ from typing import Optional, Dict, Any, List
 logger = logging.getLogger("deep_reasoner")
 
 MODEL_DIR = os.path.expanduser("~/.cache/web_search_tool/models")
-GEMMA_GGUF_PATH = os.path.join(MODEL_DIR, "gemma-2-2b-it-Q4_K_M.gguf")
+GEMMA_GGUF_PATH = os.path.join(MODEL_DIR, "gemma-4-E2B-it-Q4_K_M.gguf")
+
+# Full GPU offload. Measured on a 6GB card with GLiNER + the cross-encoder
+# also resident in the same daemon process: peak VRAM after a full-length
+# (700 token) generation is ~3.1GB, leaving ~3GB headroom -- comfortable.
+# (An earlier, lower estimate here was based on a contaminated reading from
+# a stray leftover process; re-measured clean and this is the real number.)
+# Full offload runs at ~47 tok/s vs ~27 tok/s at 30/35 layers.
+GPU_LAYERS_WHEN_CUDA = -1
 
 _LLM_INSTANCE = None
 
@@ -24,7 +32,7 @@ def is_cuda_available() -> bool:
         return False
 
 def load_reasoner_model():
-    """Lazily load the quantized Gemma 2 2B model."""
+    """Lazily load the quantized Gemma 4 E2B model."""
     global _LLM_INSTANCE
     if _LLM_INSTANCE is not None:
         return _LLM_INSTANCE
@@ -36,9 +44,8 @@ def load_reasoner_model():
     try:
         from llama_cpp import Llama
         use_gpu = is_cuda_available()
-        # Offload all layers to GPU if CUDA available, otherwise CPU
-        gpu_layers = -1 if use_gpu else 0
-        
+        gpu_layers = GPU_LAYERS_WHEN_CUDA if use_gpu else 0
+
         _LLM_INSTANCE = Llama(
             model_path=GEMMA_GGUF_PATH,
             n_ctx=4096,
@@ -70,35 +77,34 @@ def extract_deep_intelligence(
     # Truncate content to fit context window comfortably
     trimmed_content = content[:6000]
 
-    prompt = f"""<start_of_turn>user
-You are an expert technical intelligence and extraction engine. Your job is to extract all relevant information, opportunities, solutions, or facts from the web document that answer the user's research goal.
-
-User Research Goal: "{goal}"
-
-Web Document Content:
-\"\"\"
-{trimmed_content}
-\"\"\"
-
-Strict Extraction Instructions:
-1. Identify all specific entities, events, hackathons, grants, competitions, tools, or solutions.
-2. Even if an event, workaround, or solution has an unfamiliar or niche name, or is listed without upvotes, PRESERVE IT VERBATIM if it addresses the user's goal.
-3. Extract concrete details: exact names, dates, deadlines, requirements, and prizes/benefits.
-4. Remove conversational fluff, ads, and layout boilerplate.
-5. Format the extracted findings as clean, structured Markdown bullet points.
-<end_of_turn>
-<start_of_turn>model
-"""
+    system_prompt = (
+        "You are an expert technical intelligence and extraction engine. Your job is to extract all "
+        "relevant information, opportunities, solutions, or facts from the web document that answer the "
+        "user's research goal.\n\n"
+        "Strict Extraction Instructions:\n"
+        "1. Identify all specific entities, events, hackathons, grants, competitions, tools, or solutions.\n"
+        "2. Even if an event, workaround, or solution has an unfamiliar or niche name, or is listed without "
+        "upvotes, PRESERVE IT VERBATIM if it addresses the user's goal.\n"
+        "3. Extract concrete details: exact names, dates, deadlines, requirements, and prizes/benefits.\n"
+        "4. Remove conversational fluff, ads, and layout boilerplate.\n"
+        "5. Format the extracted findings as clean, structured Markdown bullet points."
+    )
+    user_prompt = f'User Research Goal: "{goal}"\n\nWeb Document Content:\n"""\n{trimmed_content}\n"""'
 
     try:
-        output = llm(
-            prompt,
+        # Uses the model's own embedded chat template (via create_chat_completion)
+        # rather than hand-rolled special tokens, so this keeps working correctly
+        # if the GGUF is swapped for a different model/family later.
+        output = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
             max_tokens=max_tokens,
             temperature=0.2,
             top_p=0.9,
-            stop=["<end_of_turn>", "<start_of_turn>"]
         )
-        text = output["choices"][0]["text"].strip()
+        text = output["choices"][0]["message"]["content"].strip()
         return text if text else "No matching intelligence found in document."
     except Exception as e:
         logger.error(f"Inference error in deep reasoner: {e}")

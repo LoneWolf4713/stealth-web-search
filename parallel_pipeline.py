@@ -6,20 +6,24 @@ Parallel Search & Intelligent Retrieval Engine.
 - Zero-Shot Entity Extraction via GLiNER with confidence thresholding.
 - Strict response character ceiling (24k chars) to prevent context token overflow.
 - Clean source partitioning: failed/blocked sources moved to compact footer.
+
+Pipeline shape: fetching is I/O-bound and runs fully concurrently across pages.
+Neural scoring (reranker + NER) is CPU/GPU-bound and runs ONCE per search across
+ALL pages in a single batched model call each, instead of once per page -- see
+neural_fast.rerank_pages_batch / extract_entities_batch for why that matters.
 """
 import os
 import sys
 import json
 import time
 import fcntl
-import gc
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from searcher import search_web, search_news
-from fetcher import fetch_page_detailed
+from fetcher import fetch_page_detailed, classify_page_issues
 from chunker import chunk_markdown_smart, get_table_of_contents, extract_section
-from neural_fast import rerank_chunks, extract_entities, get_device
+from neural_fast import rerank_pages_batch, extract_entities_batch, get_device
 
 # Throttled worker count to prevent memory exhaustion in constrained (WSL) environments
 DEFAULT_WORKERS = min(3, os.cpu_count() or 2)
@@ -47,119 +51,41 @@ class MLHardwareLock:
             except Exception:
                 pass
 
-def _cleanup_memory():
-    """Explicitly clean up garbage and release CUDA VRAM back to OS."""
-    gc.collect()
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
-
-def process_single_url(
-    item: Dict[str, Any],
-    query: str,
-    instruction: Optional[str] = None,
-    extract_ner: bool = True,
-    top_chunks_per_page: int = 3
-) -> Dict[str, Any]:
-    """Fetch, chunk, neural-rerank, and extract entities for a single search result."""
+def _fetch_and_chunk_url(item: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Fetch a single URL and chunk its content. Pure I/O + lightweight CPU work --
+    no neural model is touched here, so this is safe to run with high concurrency.
+    """
     url = item.get("href")
     title = item.get("title", "")
     snippet = item.get("body", "")
+    base = {"title": title, "url": url or "", "snippet": snippet, "chunks": []}
 
     if not url:
-        return {
-            "title": title,
-            "url": "",
-            "snippet": snippet,
-            "top_passages": [],
-            "entities": [],
-            "status": "failed",
-            "error_reason": "Missing URL"
-        }
+        return {**base, "status": "failed", "error_reason": "Missing URL"}
 
     try:
         fetch_res = fetch_page_detailed(url)
         if not fetch_res.get("success", False):
-            return {
-                "title": title,
-                "url": url,
-                "snippet": snippet,
-                "top_passages": [],
-                "entities": [],
-                "status": "failed",
-                "error_reason": fetch_res.get("error_reason", "Access restricted / blocked")
-            }
+            return {**base, "status": "failed", "error_reason": fetch_res.get("error_reason", "Access restricted / blocked")}
 
         content = fetch_res.get("content", "")
         if not content or len(content.strip()) < 80:
-            return {
-                "title": title,
-                "url": url,
-                "snippet": snippet,
-                "top_passages": [],
-                "entities": [],
-                "status": "failed",
-                "error_reason": "Page loaded but main content was empty or unparseable"
-            }
+            return {**base, "status": "failed", "error_reason": "Page loaded but main content was empty or unparseable"}
 
         # Double-lock check: ensure no robot checks, JS-walls, or login walls masquerade as content
-        from fetcher import classify_page_issues
         block_issue = classify_page_issues(content[:2500], content[:2500], url=url)
         if block_issue and block_issue != "Page loaded but main content was empty or protected":
-            return {
-                "title": title,
-                "url": url,
-                "snippet": snippet,
-                "top_passages": [],
-                "entities": [],
-                "status": "failed",
-                "error_reason": block_issue
-            }
+            return {**base, "status": "failed", "error_reason": block_issue}
 
-        # 1. Code-block preserving semantic chunking with recursive sub-chunking
+        # Code-block preserving semantic chunking with recursive sub-chunking
         raw_chunks = chunk_markdown_smart(content, max_chunk_words=350)
         if not raw_chunks:
-            return {
-                "title": title,
-                "url": url,
-                "snippet": snippet,
-                "top_passages": [],
-                "entities": [],
-                "status": "failed",
-                "error_reason": "No text sections could be extracted"
-            }
+            return {**base, "status": "failed", "error_reason": "No text sections could be extracted"}
 
-        # 2. Neural Cross-Encoder Reranker (calibrated percentage match)
-        ranked = rerank_chunks(query, raw_chunks, instruction=instruction, top_k=top_chunks_per_page)
-
-        # 3. GLiNER Entity Extraction (only on top ranked passages)
-        entities = []
-        if extract_ner and ranked:
-            combined_top = "\n".join([c.get("content", "") for c in ranked])
-            entities = extract_entities(combined_top)
-
-        return {
-            "title": title,
-            "url": url,
-            "snippet": snippet,
-            "top_passages": ranked,
-            "entities": entities,
-            "status": "success",
-            "error_reason": None
-        }
+        return {**base, "chunks": raw_chunks, "status": "success", "error_reason": None}
     except Exception as e:
-        return {
-            "title": title,
-            "url": url,
-            "snippet": snippet,
-            "top_passages": [],
-            "entities": [],
-            "status": "failed",
-            "error_reason": f"Processing error: {str(e)[:80]}"
-        }
+        return {**base, "status": "failed", "error_reason": f"Processing error: {str(e)[:80]}"}
 
 def fast_intelligent_search(
     query: str,
@@ -174,7 +100,7 @@ def fast_intelligent_search(
     End-to-End Fast Neural Search with Perspective Routing (tech, market, dual):
     1. Keyless search with SQLite cache and URL deduplication.
     2. Parallel multi-threaded fetch with SSL fallback and content classification.
-    3. Neural chunk reranking + GLiNER entity extraction.
+    3. ONE batched neural rerank + NER pass across every fetched page.
     """
     t0 = time.perf_counter()
     search_results = search_web(query, max_results=max_results, perspective=perspective)
@@ -189,29 +115,46 @@ def fast_intelligent_search(
             "total_fetched": 0
         }
 
+    # Phase 1: concurrent fetch + chunk (I/O-bound; no ML contention, so this can
+    # run fully in parallel without touching MLHardwareLock at all).
+    fetched: List[Dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_fetch_and_chunk_url, item): item for item in search_results}
+        for f in as_completed(futures):
+            res = f.result()
+            orig = futures[f]
+            res["perspective"] = orig.get("perspective", "tech")
+            fetched.append(res)
+
+    # Phase 2: single batched neural pass across every successfully-fetched page.
+    # The lock here only guards actual model inference, not network I/O.
+    successful_idx = [i for i, r in enumerate(fetched) if r["status"] == "success" and r.get("chunks")]
+    if successful_idx:
+        with MLHardwareLock():
+            pages_chunks = [fetched[i]["chunks"] for i in successful_idx]
+            ranked_per_page = rerank_pages_batch(query, pages_chunks, instruction=instruction, top_k=top_chunks_per_page)
+
+            if extract_ner:
+                entity_texts = [
+                    "\n".join(c.get("content", "") for c in ranked) if ranked else ""
+                    for ranked in ranked_per_page
+                ]
+                entities_per_page = extract_entities_batch(entity_texts)
+            else:
+                entities_per_page = [[] for _ in ranked_per_page]
+
+            for pos, i in enumerate(successful_idx):
+                fetched[i]["top_passages"] = ranked_per_page[pos]
+                fetched[i]["entities"] = entities_per_page[pos]
+
     detailed_results = []
-    with MLHardwareLock():
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(
-                    process_single_url,
-                    item,
-                    query,
-                    instruction,
-                    extract_ner,
-                    top_chunks_per_page
-                ): item
-                for item in search_results
-            }
-            for f in as_completed(futures):
-                res = f.result()
-                orig = futures[f]
-                res["perspective"] = orig.get("perspective", "tech")
-                detailed_results.append(res)
+    for r in fetched:
+        r.setdefault("top_passages", [])
+        r.setdefault("entities", [])
+        r.pop("chunks", None)
+        detailed_results.append(r)
 
-        elapsed = round(time.perf_counter() - t0, 3)
-        _cleanup_memory()
-
+    elapsed = round(time.perf_counter() - t0, 3)
     return {
         "query": query,
         "perspective": perspective,
@@ -273,7 +216,7 @@ def format_fast_digest(data: Dict[str, Any]) -> str:
         out = [f"### {idx}. [{r.get('title')}]({r.get('url')})"]
         if r.get("snippet"):
             out.append(f"**Overview**: {r.get('snippet')}\n")
-        
+
         entities = r.get("entities", [])
         if entities:
             ent_str = ", ".join([f"`{e['entity']}` *({e['label']})*" for e in entities[:6]])
@@ -344,8 +287,9 @@ def deep_reasoning_search(
 ) -> Dict[str, Any]:
     """
     Phase 2 Deep Reasoning Search:
-    Executes search -> fetches pages -> runs local quantized Gemma 2 2B SLM
-    strictly on ACCESSIBLE pages to extract deep semantic intelligence.
+    Executes search -> fetches pages concurrently -> runs the local quantized
+    Gemma 2 2B SLM sequentially (single model instance) strictly on ACCESSIBLE
+    pages to extract deep semantic intelligence.
     """
     t0 = time.perf_counter()
     from deep_reasoner import extract_deep_intelligence
@@ -360,73 +304,79 @@ def deep_reasoning_search(
             "total_fetched": 0
         }
 
+    # Phase 1: concurrent fetch (I/O-bound; no model lock needed here)
+    fetched_pages = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_item = {
+            executor.submit(fetch_page_detailed, item.get("href", "")): item
+            for item in search_results
+            if item.get("href")
+        }
+        for future in as_completed(future_to_item):
+            item = future_to_item[future]
+            try:
+                fetch_res = future.result()
+            except Exception as e:
+                fetch_res = {"success": False, "error_reason": f"Fetch error: {str(e)[:80]}"}
+            fetched_pages.append((item, fetch_res))
+
+    # Phase 2: sequential SLM reasoning -- single Llama instance, must stay serialized
     detailed_results = []
     with MLHardwareLock():
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_item = {
-                executor.submit(fetch_page_detailed, item.get("href", "")): item
-                for item in search_results
-                if item.get("href")
-            }
-            for future in as_completed(future_to_item):
-                item = future_to_item[future]
-                url = item.get("href", "")
-                title = item.get("title", "")
-                perspective_tag = item.get("perspective", "tech")
-                snippet = item.get("body", "")
+        for item, fetch_res in fetched_pages:
+            url = item.get("href", "")
+            title = item.get("title", "")
+            perspective_tag = item.get("perspective", "tech")
+            snippet = item.get("body", "")
 
-                try:
-                    fetch_res = future.result()
-                    if not fetch_res.get("success", False):
-                        detailed_results.append({
-                            "title": title,
-                            "url": url,
-                            "perspective": perspective_tag,
-                            "snippet": snippet,
-                            "extracted_intelligence": "",
-                            "status": "failed",
-                            "error_reason": fetch_res.get("error_reason", "Access restricted / blocked")
-                        })
-                        continue
+            if not fetch_res.get("success", False):
+                detailed_results.append({
+                    "title": title,
+                    "url": url,
+                    "perspective": perspective_tag,
+                    "snippet": snippet,
+                    "extracted_intelligence": "",
+                    "status": "failed",
+                    "error_reason": fetch_res.get("error_reason", "Access restricted / blocked")
+                })
+                continue
 
-                    content = fetch_res.get("content", "")
-                    if not content or len(content.strip()) < 80:
-                        detailed_results.append({
-                            "title": title,
-                            "url": url,
-                            "perspective": perspective_tag,
-                            "snippet": snippet,
-                            "extracted_intelligence": "",
-                            "status": "failed",
-                            "error_reason": "Page content was empty or unparseable"
-                        })
-                        continue
+            content = fetch_res.get("content", "")
+            if not content or len(content.strip()) < 80:
+                detailed_results.append({
+                    "title": title,
+                    "url": url,
+                    "perspective": perspective_tag,
+                    "snippet": snippet,
+                    "extracted_intelligence": "",
+                    "status": "failed",
+                    "error_reason": "Page content was empty or unparseable"
+                })
+                continue
 
-                    # Only run SLM reasoning on accessible, real content
-                    intelligence = extract_deep_intelligence(content, query, reasoning_intent)
-                    detailed_results.append({
-                        "title": title,
-                        "url": url,
-                        "perspective": perspective_tag,
-                        "snippet": snippet,
-                        "extracted_intelligence": intelligence,
-                        "status": "success",
-                        "error_reason": None
-                    })
-                except Exception as e:
-                    detailed_results.append({
-                        "title": title,
-                        "url": url,
-                        "perspective": perspective_tag,
-                        "snippet": snippet,
-                        "extracted_intelligence": "",
-                        "status": "failed",
-                        "error_reason": f"Reasoning error: {str(e)[:80]}"
-                    })
+            try:
+                intelligence = extract_deep_intelligence(content, query, reasoning_intent)
+                detailed_results.append({
+                    "title": title,
+                    "url": url,
+                    "perspective": perspective_tag,
+                    "snippet": snippet,
+                    "extracted_intelligence": intelligence,
+                    "status": "success",
+                    "error_reason": None
+                })
+            except Exception as e:
+                detailed_results.append({
+                    "title": title,
+                    "url": url,
+                    "perspective": perspective_tag,
+                    "snippet": snippet,
+                    "extracted_intelligence": "",
+                    "status": "failed",
+                    "error_reason": f"Reasoning error: {str(e)[:80]}"
+                })
 
-        elapsed = round(time.perf_counter() - t0, 3)
-        _cleanup_memory()
-
+    elapsed = round(time.perf_counter() - t0, 3)
     return {
         "query": query,
         "perspective": perspective,

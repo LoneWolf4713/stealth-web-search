@@ -8,6 +8,7 @@ Tier 3: Internet Archive Wayback Machine fallback for SSL/connection failure rec
 import io
 import re
 import sys
+import atexit
 import logging
 import subprocess
 import threading
@@ -27,6 +28,8 @@ from vault import (
 
 logger = logging.getLogger("stealth_fetcher")
 _BROWSER_LOCK = threading.Lock()
+_SHARED_BROWSER_CM = None
+_SHARED_BROWSER = None
 
 CLOUDFLARE_INDICATORS = [
     "Just a moment...",
@@ -261,25 +264,61 @@ def fetch_fast_tier(
     reason = issue if issue else f"HTTP {resp.status_code}"
     return False, "", resp.content, reason
 
+def _get_shared_browser():
+    """
+    Lazily launch one Camoufox browser process and keep it alive for the life of
+    this process, reusing it across fetches instead of paying a multi-second
+    browser launch cost on every stealth-tier fetch. Caller must hold _BROWSER_LOCK.
+    """
+    global _SHARED_BROWSER_CM, _SHARED_BROWSER
+    if _SHARED_BROWSER is not None:
+        try:
+            if _SHARED_BROWSER.is_connected():
+                return _SHARED_BROWSER
+        except Exception:
+            pass
+        _close_shared_browser()
+
+    from camoufox.sync_api import Camoufox
+    _SHARED_BROWSER_CM = Camoufox(headless=True)
+    _SHARED_BROWSER = _SHARED_BROWSER_CM.__enter__()
+    return _SHARED_BROWSER
+
+def _close_shared_browser():
+    """Tear down the shared browser (on process exit, or after it crashes/disconnects)."""
+    global _SHARED_BROWSER_CM, _SHARED_BROWSER
+    if _SHARED_BROWSER_CM is not None:
+        try:
+            _SHARED_BROWSER_CM.__exit__(None, None, None)
+        except Exception:
+            pass
+    _SHARED_BROWSER_CM = None
+    _SHARED_BROWSER = None
+
+atexit.register(_close_shared_browser)
+
 def fetch_stealth_tier(url: str, timeout: int = 25) -> Tuple[bool, str, Optional[str]]:
     """
     Tier 2: Headless browser using Camoufox with ignore_https_errors=True.
     Solves complex challenges, SPAs, and invalid certificate chains.
+    Reuses a single shared browser process across calls (see _get_shared_browser);
+    only a page is opened/closed per fetch, not the whole browser.
     Returns: (success: bool, markdown: str, error_reason: Optional[str])
     """
     domain = extract_domain(url)
+    page = None
     try:
-        from camoufox.sync_api import Camoufox
         with _BROWSER_LOCK:
-            with Camoufox(headless=True) as browser:
-                page = browser.new_page(ignore_https_errors=True)
+            browser = _get_shared_browser()
+            page = browser.new_page(ignore_https_errors=True)
+            try:
                 nav_resp = page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
                 if nav_resp and nav_resp.status == 404:
                     return False, "", "HTTP 404 (Not Found)"
                 if nav_resp and nav_resp.status == 410:
                     return False, "", "HTTP 410 (Gone)"
                 page.wait_for_timeout(2500)
-                
+
                 # Harvest cookies from browser session
                 try:
                     cookies = page.context.cookies()
@@ -291,10 +330,6 @@ def fetch_stealth_tier(url: str, timeout: int = 25) -> Tuple[bool, str, Optional
                     pass
 
                 html = page.content()
-                
-                # Check if browser loaded a PDF directly
-                if html.startswith("%PDF-") or 'type="application/pdf"' in html:
-                    pass
 
                 md = trafilatura.extract(
                     html,
@@ -318,11 +353,19 @@ def fetch_stealth_tier(url: str, timeout: int = 25) -> Tuple[bool, str, Optional
                         return False, "", issue
                     set_cached_page(url, cleaned, ttl_hours=48.0)
                     return True, cleaned, None
-                
+
                 issue = classify_page_issues(html, md or "", url=url)
                 return False, "", issue or "Page loaded but content was empty or protected"
+            finally:
+                try:
+                    page.close()
+                except Exception:
+                    pass
     except Exception as e:
         err_msg = str(e)
+        if any(k in err_msg.lower() for k in ("closed", "disconnected", "crashed")):
+            with _BROWSER_LOCK:
+                _close_shared_browser()
         if "SEC_ERROR" in err_msg:
             return False, "", "SSL Certificate Error (Untrusted Issuer)"
         if "Timeout" in err_msg:

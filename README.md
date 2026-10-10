@@ -16,7 +16,7 @@ A fast, lightweight web search and information retrieval tool for developers and
   - `toc`: Reads the table of contents outline of large documentation pages (~150 tokens).
   - `section`: Reads only a specific section by heading name or index.
 - **Two Retrieval Modes**:
-  - **Fast Mode**: Rapidly fetches pages, extracts key entities, and reranks relevant passages (< 1s).
+  - **Fast Mode**: Rapidly fetches pages, extracts key entities, and reranks relevant passages. Sub-second once the shared daemon is warm and results are cached; the first call after the daemon starts (or a new query) typically takes 5-25s while models load and pages are fetched.
   - **Deep Mode**: Comprehensive analysis using a local language model to synthesize findings into structured notes.
 - **MCP Server Support**: Plug-and-play Model Context Protocol server for Claude Code, Antigravity, and any MCP client.
 
@@ -42,11 +42,11 @@ export CMAKE_ARGS="-DGGML_CUDA=on -DGGML_AVX512=off -DCMAKE_CUDA_ARCHITECTURES=8
 uv pip install --no-binary llama-cpp-python --reinstall llama-cpp-python
 ```
 
-Download the lightweight Gemma 2 (2B-IT) model:
+Download the lightweight Gemma 4 (E2B-IT) model:
 ```bash
 mkdir -p ~/.cache/web_search_tool/models
 aria2c -x 4 -s 4 -d ~/.cache/web_search_tool/models \
-  "https://huggingface.co/bartowski/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it-Q4_K_M.gguf"
+  "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf"
 ```
 
 ---
@@ -107,6 +107,8 @@ Run multiple queries in a safe, sequential batch:
 
 The tool includes a built-in MCP server (`mcp_server.py`) that lets AI coding assistants search and browse the web directly.
 
+**Shared daemon**: `mcp_server.py` is a thin stdio shim. On first tool call, it auto-spawns `daemon.py` (a background process holding the loaded models and the shared browser) and forwards all requests to it over a Unix socket at `~/.cache/web_search_tool/daemon.sock`. This matters if you run multiple MCP client apps at once (Claude Code, Claude Desktop, Antigravity, a local LLM's MCP client, ...) -- each one launches its own `mcp_server.py` process, but they all share the ONE daemon, so models and the browser are only ever loaded once regardless of how many client apps are open. The daemon auto-exits after 30 minutes of inactivity. Logs: `~/.cache/web_search_tool/daemon.log`.
+
 ### Configuration for Claude Code / Claude Desktop
 Add this to your `~/.claude.json` or desktop configuration:
 
@@ -126,7 +128,7 @@ Add this to your `~/.claude.json` or desktop configuration:
 | Tool Name | Purpose | Parameters |
 |---|---|---|
 | `search` | Quick web search with summaries | `query` (str), `max_results` (int), `perspective` ('tech'/'market'/'dual') |
-| `fetch` | Fetch page content as Markdown (capped at 20k chars) | `url` (str), `force_browser` (bool) |
+| `fetch` | Fetch page content as Markdown (capped at 25k chars) | `url` (str), `force_browser` (bool) |
 | `get_toc` | View document table of contents (~150 tokens) | `url` (str) |
 | `read_section` | Read a specific section of a document (~400 tokens) | `url` (str), `section_name_or_index` (str) |
 | `fast_neural_search` | Multi-source search with passage ranking | `query` (str), `instruction` (str), `num_pages` (int), `perspective` |
@@ -136,7 +138,8 @@ Add this to your `~/.claude.json` or desktop configuration:
 ### Best Practices for AI Agents
 - **Token Safety & Bounded Output**: All responses report estimated token and character counts in the header. Responses are strictly capped to ~24,000 characters (~5k tokens) to prevent context overflow.
 - **Clean Source Isolation**: Inaccessible or blocked pages (such as login walls or invalid certs) are cleanly separated into a footer section so failed fetches never masquerade as content.
-- **Batch Searches**: When investigating multiple related topics, use `batch_search` instead of firing parallel tool calls in a single turn. Hardware semaphores serialize model runs to protect host memory.
+- **Batch Searches**: When investigating multiple related topics, use `batch_search` instead of firing parallel tool calls in a single turn. Hardware semaphores (inside the shared daemon, see above) serialize model runs to protect host memory.
+- **First-call latency**: if the daemon isn't already running, the very first tool call triggers a background spawn plus cold model loading, so it can take 5-25s (deep mode a bit more). Every call after that, while the daemon stays warm, is much faster.
 
 ---
 

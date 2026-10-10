@@ -125,7 +125,7 @@ def deep(
     max_results: int = typer.Option(3, "--num", "-n", help="Number of pages to crawl"),
     json_output: bool = typer.Option(False, "--json", "-j", help="Output raw JSON")
 ):
-    """Deep Reasoning Mode: Local quantized Gemma 2 SLM semantic extraction."""
+    """Deep Reasoning Mode: Local quantized Gemma 4 SLM semantic extraction."""
     from parallel_pipeline import deep_reasoning_search, format_deep_digest
     console.print(f"[bold magenta]Running Deep SLM Reasoning [Perspective: {perspective.upper()}] for: '{query}'[/bold magenta]")
     data = deep_reasoning_search(
@@ -134,6 +134,10 @@ def deep(
         reasoning_intent=intent or None,
         max_results=max_results
     )
+    if json_output:
+        print(json.dumps(data, indent=2))
+    else:
+        print(format_deep_digest(data))
 @app.command()
 def batch(
     queries: list[str] = typer.Argument(..., help="Search queries to execute in batch"),

@@ -18,6 +18,7 @@ build/
 # Cache & Storage
 *.sqlite
 *.sqlite3
+*.db
 *.log
 .cache/
 models/
