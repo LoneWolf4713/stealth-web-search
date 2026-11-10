@@ -447,16 +447,17 @@ def fetch_page(
     url: str,
     force_stealth: bool = False,
     use_cache: bool = True,
-    skip_tls_verify: bool = True
+    skip_tls_verify: bool = True,
+    max_chars: Optional[int] = 6000
 ) -> str:
-    """Convenience string fetcher with 25k character hard cap and (truncated) notice."""
+    """Convenience string fetcher with 6,000 character hard cap and (truncated) notice."""
     res = fetch_page_detailed(url, force_stealth=force_stealth, use_cache=use_cache, skip_tls_verify=skip_tls_verify)
     if res["success"]:
         content = res["content"]
-        if len(content) > 25000:
-            content = content[:24600] + (
+        if max_chars and len(content) > max_chars:
+            content = content[:max_chars - 300] + (
                 "\n\n> [!NOTE]\n"
-                f"> *Webpage content capped at 25,000 characters (truncated). Use `get_toc('{url}')` and `read_section` to read specific sections.*"
+                f"> *Webpage content capped at 6,000 characters to protect context window. Use `get_toc('{url}')` and `read_section` to inspect specific sections.*"
             )
         return content
     return f"Failed to retrieve {url}: {res['error_reason']}"

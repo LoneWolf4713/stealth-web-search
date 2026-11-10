@@ -89,7 +89,13 @@ def read_section(url: str, section_name_or_index: str) -> str:
     return daemon_request("read_section", url=url, section_name_or_index=section_name_or_index)
 
 @mcp.tool()
-def fast_neural_search(query: str, instruction: str = "", num_pages: int = 4, perspective: str = "tech") -> str:
+def fast_neural_search(
+    query: str,
+    instruction: str = "",
+    num_pages: int = 4,
+    perspective: str = "tech",
+    density: str = "compact"
+) -> str:
     """
     Perform an intelligent multi-source web search that fetches relevant pages,
     reranks the most pertinent passages, and extracts key entities and facts.
@@ -102,13 +108,28 @@ def fast_neural_search(query: str, instruction: str = "", num_pages: int = 4, pe
         instruction: Optional guidance for prioritizing specific types of information.
         num_pages: Number of pages to analyze (default: 4).
         perspective: 'tech' (default), 'market', or 'dual'.
+        density: Output formatting density level:
+            - 'compact' (default): Token-optimized digest (~800 tokens max) with top-1 passage per source,
+              ideal for repetitive agentic research loops to eliminate context window exhaustion.
+            - 'balanced': Moderate density (~1,900 tokens max) with top-2 passages per source.
+            - 'raw': Legacy verbose output (~5,500 tokens max) with top-3 passages per source.
     """
     return daemon_request(
-        "fast_neural_search", query=query, instruction=instruction, num_pages=num_pages, perspective=perspective
+        "fast_neural_search",
+        query=query,
+        instruction=instruction,
+        num_pages=num_pages,
+        perspective=perspective,
+        density=density
     )
 
 @mcp.tool()
-def batch_search(queries: list[str], max_results_per_query: int = 3, perspective: str = "tech") -> str:
+def batch_search(
+    queries: list[str],
+    max_results_per_query: int = 3,
+    perspective: str = "tech",
+    density: str = "compact"
+) -> str:
     """
     Execute multiple search queries in a safe, sequential batch.
     Use this when you need answers for 2 or more related questions without making separate parallel tool calls.
@@ -117,9 +138,17 @@ def batch_search(queries: list[str], max_results_per_query: int = 3, perspective
         queries: List of search query strings (max 3 queries per batch).
         max_results_per_query: Number of pages per query (default: 3).
         perspective: 'tech' (default), 'market', or 'dual'.
+        density: Output formatting density level:
+            - 'compact' (default): Token-optimized digest (~800 tokens per query).
+            - 'balanced': Moderate density (~1,900 tokens per query).
+            - 'raw': Legacy verbose output (~5,500 tokens per query).
     """
     return daemon_request(
-        "batch_search", queries=queries, max_results_per_query=max_results_per_query, perspective=perspective
+        "batch_search",
+        queries=queries,
+        max_results_per_query=max_results_per_query,
+        perspective=perspective,
+        density=density
     )
 
 @mcp.tool()

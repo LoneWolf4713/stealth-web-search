@@ -79,7 +79,7 @@ def toc(
 ):
     """Get the Table of Contents outline of a documentation page (~150 tokens)."""
     console.print(f"[dim]Inspecting TOC for {url}...[/dim]")
-    content = fetch_page(url)
+    content = fetch_page(url, max_chars=None)
     outline = get_table_of_contents(content)
     print(outline)
 
@@ -90,7 +90,7 @@ def section(
 ):
     """Extract a single targeted section from a large documentation page."""
     console.print(f"[dim]Extracting section '{target}' from {url}...[/dim]")
-    content = fetch_page(url)
+    content = fetch_page(url, max_chars=None)
     sec = extract_section(content, target)
     print(sec)
 
@@ -100,22 +100,24 @@ def fast(
     instruction: str = typer.Option("", "--instruction", "-i", help="Task instruction for reranker"),
     perspective: str = typer.Option("tech", "--perspective", "-p", help="Perspective: tech (open-source), market (commercial), or dual (both)"),
     max_results: int = typer.Option(4, "--num", "-n", help="Number of pages to crawl"),
+    density: str = typer.Option("compact", "--density", "-d", help="Output density: compact (default, ~800 tokens), balanced (~1900 tokens), raw (~5500 tokens)"),
     json_output: bool = typer.Option(False, "--json", "-j", help="Output raw JSON")
 ):
     """Fast Neural Mode: Cross-Encoder Reranking + GLiNER Entity Extraction."""
     dev = get_device().upper()
-    console.print(f"[bold cyan]Running Fast Neural Search on [{dev}] [Perspective: {perspective.upper()}] for: '{query}'[/bold cyan]")
+    console.print(f"[bold cyan]Running Fast Neural Search on [{dev}] [Perspective: {perspective.upper()}] [Density: {density.upper()}] for: '{query}'[/bold cyan]")
     data = fast_intelligent_search(
         query,
         max_results=max_results,
         perspective=perspective,
-        instruction=instruction or None
+        instruction=instruction or None,
+        density=density
     )
     
     if json_output:
         print(json.dumps(data, indent=2))
     else:
-        print(format_fast_digest(data))
+        print(format_fast_digest(data, density=density))
 
 @app.command()
 def deep(
@@ -142,13 +144,14 @@ def deep(
 def batch(
     queries: list[str] = typer.Argument(..., help="Search queries to execute in batch"),
     perspective: str = typer.Option("tech", "--perspective", "-p", help="Perspective: tech (open-source), market (commercial), or dual (both)"),
-    max_results: int = typer.Option(3, "--num", "-n", help="Number of pages per query")
+    max_results: int = typer.Option(3, "--num", "-n", help="Number of pages per query"),
+    density: str = typer.Option("compact", "--density", "-d", help="Output density: compact (default, ~800 tokens), balanced (~1900 tokens), raw (~5500 tokens)")
 ):
     """Execute multiple search queries in a safe, sequential batch."""
     for idx, q in enumerate(queries, 1):
         console.print(f"[bold cyan]Batch Query [{idx}/{len(queries)}]: '{q}'[/bold cyan]")
-        data = fast_intelligent_search(q, max_results=max_results, perspective=perspective)
-        print(format_fast_digest(data))
+        data = fast_intelligent_search(q, max_results=max_results, perspective=perspective, density=density)
+        print(format_fast_digest(data, density=density))
         if idx < len(queries):
             print("\n" + "=" * 50 + "\n")
 

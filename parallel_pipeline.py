@@ -94,7 +94,8 @@ def fast_intelligent_search(
     instruction: Optional[str] = None,
     extract_ner: bool = True,
     top_chunks_per_page: int = 3,
-    max_workers: int = DEFAULT_WORKERS
+    max_workers: int = DEFAULT_WORKERS,
+    density: str = "compact"
 ) -> Dict[str, Any]:
     """
     End-to-End Fast Neural Search with Perspective Routing (tech, market, dual):
@@ -109,6 +110,7 @@ def fast_intelligent_search(
         return {
             "query": query,
             "perspective": perspective,
+            "density": density,
             "device": get_device(),
             "elapsed_seconds": round(time.perf_counter() - t0, 3),
             "results": search_results,
@@ -158,6 +160,7 @@ def fast_intelligent_search(
     return {
         "query": query,
         "perspective": perspective,
+        "density": density,
         "device": get_device(),
         "elapsed_seconds": elapsed,
         "workers_used": max_workers,
@@ -165,19 +168,22 @@ def fast_intelligent_search(
         "results": detailed_results
     }
 
-def format_fast_digest(data: Dict[str, Any]) -> str:
+def format_fast_digest(data: Dict[str, Any], density: Optional[str] = None) -> str:
     """Format intelligent research results into token-dense Markdown with size ceiling & source partitioning."""
     perspective = data.get("perspective", "tech")
     results = data.get("results", [])
     elapsed = data.get("elapsed_seconds", 0)
     device = data.get("device", "cpu").upper()
+    density = (density or data.get("density") or "compact").lower()
+    if density not in ("compact", "balanced", "raw"):
+        density = "compact"
 
     successful = [r for r in results if r.get("status") == "success" and r.get("top_passages")]
     failed = [r for r in results if r.get("status") != "success" or not r.get("top_passages")]
 
     lines = [
         f"# Research Digest: `{data.get('query')}`",
-        f"*Perspective: {perspective.upper()} | Sources: {len(successful)}/{len(results)} accessible | Time: {elapsed}s on {device}*\n"
+        f"*Tokens: ~0 | Chars: 0 | Density: {density.upper()} | Time: {elapsed}s on {device}*\n"
     ]
 
     # If completely 100% of sources failed, report clear notice
@@ -189,7 +195,33 @@ def format_fast_digest(data: Dict[str, Any]) -> str:
             lines.append("### Failed / Inaccessible Sources:")
             for r in failed:
                 lines.append(f"- [{r.get('title')}]({r.get('url')}): *{r.get('error_reason', 'Access blocked')}*")
-        return "\n".join(lines)
+        full_output = "\n".join(lines)
+        est_tokens = int(len(full_output) / 4.2)
+        meta_line = f"*Tokens: ~{est_tokens:,} | Chars: {len(full_output):,} | Density: {density.upper()} | Time: {elapsed}s on {device}*\n"
+        lines_split = full_output.split("\n")
+        if len(lines_split) > 1:
+            lines_split[1] = meta_line
+            full_output = "\n".join(lines_split)
+        return full_output
+
+    if density == "compact":
+        max_lead_chars = 280
+        passages_per_source = 2 if len(successful) <= 2 else 1
+        max_passage_chars = 600
+        max_entities = 4
+        max_total_chars = 3500
+    elif density == "balanced":
+        max_lead_chars = 420
+        passages_per_source = 2
+        max_passage_chars = 1000
+        max_entities = 6
+        max_total_chars = 8000
+    else:  # raw / legacy
+        max_lead_chars = 420
+        passages_per_source = 3
+        max_passage_chars = 1500
+        max_entities = 6
+        max_total_chars = 25000
 
     # Extract Global Best Finding (Tavily/Perplexity-style Direct Answer)
     best_passage = None
@@ -207,8 +239,8 @@ def format_fast_digest(data: Dict[str, Any]) -> str:
         excerpt = best_passage.get("content", "").strip()
         paragraphs = [p.strip() for p in excerpt.split("\n\n") if len(p.strip()) > 30]
         lead_text = paragraphs[0] if paragraphs else excerpt
-        if len(lead_text) > 420:
-            lead_text = lead_text[:410] + "..."
+        if len(lead_text) > max_lead_chars:
+            lead_text = lead_text[:max_lead_chars - 10] + "..."
         lines.append(f"> 💡 **Top Finding / Key Evidence** ([{best_source.get('title')}]({best_source.get('url')})):")
         lines.append(f"> {lead_text}\n")
 
@@ -219,17 +251,20 @@ def format_fast_digest(data: Dict[str, Any]) -> str:
 
         entities = r.get("entities", [])
         if entities:
-            ent_str = ", ".join([f"`{e['entity']}` *({e['label']})*" for e in entities[:6]])
+            ent_str = ", ".join([f"`{e['entity']}` *({e['label']})*" for e in entities[:max_entities]])
             out.append(f"**Key Entities**: {ent_str}\n")
 
-        passages = r.get("top_passages", [])
+        passages = r.get("top_passages", [])[:passages_per_source]
         if passages:
             out.append("#### Top Relevant Passages:")
             for p in passages:
                 match_str = f" [{p.get('match_pct', '')}]" if p.get('match_pct') else ""
                 heading = p.get('heading', 'Details')
                 out.append(f"##### Section: {heading}{match_str}")
-                out.append(p.get("content", "").strip())
+                p_content = p.get("content", "").strip()
+                if len(p_content) > max_passage_chars:
+                    p_content = p_content[:max_passage_chars - 35] + "\n[... Passage truncated ...]"
+                out.append(p_content)
                 out.append("")
         out.append("\n---\n")
         return "\n".join(out)
@@ -261,20 +296,32 @@ def format_fast_digest(data: Dict[str, Any]) -> str:
     full_output = "\n".join(lines)
 
     # Enforce strict response character ceiling
-    if len(full_output) > MAX_TOTAL_OUTPUT_CHARS:
-        full_output = full_output[:MAX_TOTAL_OUTPUT_CHARS - 320] + (
+    if len(full_output) > max_total_chars:
+        full_output = full_output[:max_total_chars - 320] + (
             "\n\n> [!NOTE]\n"
-            f"> *Output capped at {MAX_TOTAL_OUTPUT_CHARS:,} characters (truncated) to protect LLM context window. Showing most relevant passages.*"
+            f"> *Output capped at {max_total_chars:,} characters (truncated) to protect LLM context window. Showing most relevant passages.*"
         )
 
     # Estimate token count (chars / 4.2 approx) and prepend to metrics
     est_tokens = int(len(full_output) / 4.2)
-    meta_line = f"*Tokens: ~{est_tokens:,} | Chars: {len(full_output):,} | Perspective: {perspective.upper()} | Time: {elapsed}s on {device}*\n"
-    # Replace second line with updated token count
+    meta_line = f"*Tokens: ~{est_tokens:,} | Chars: {len(full_output):,} | Density: {density.upper()} | Time: {elapsed}s on {device}*\n"
     lines_split = full_output.split("\n")
     if len(lines_split) > 1:
         lines_split[1] = meta_line
         full_output = "\n".join(lines_split)
+
+    # Safety check: if replacing header pushed length over max_total_chars, re-cap
+    if len(full_output) > max_total_chars:
+        full_output = full_output[:max_total_chars - 320] + (
+            "\n\n> [!NOTE]\n"
+            f"> *Output capped at {max_total_chars:,} characters (truncated) to protect LLM context window. Showing most relevant passages.*"
+        )
+        est_tokens = int(len(full_output) / 4.2)
+        meta_line = f"*Tokens: ~{est_tokens:,} | Chars: {len(full_output):,} | Density: {density.upper()} | Time: {elapsed}s on {device}*\n"
+        lines_split = full_output.split("\n")
+        if len(lines_split) > 1:
+            lines_split[1] = meta_line
+            full_output = "\n".join(lines_split)
 
     return full_output
 

@@ -100,33 +100,35 @@ def _handle_fetch(kwargs):
         url = kwargs.get("url", "")
         use_browser = kwargs.get("force_browser", False) or kwargs.get("force_stealth", False)
         skip_tls_verify = kwargs.get("skip_tls_verify", True)
-        content = fetch_page(url, force_stealth=use_browser, skip_tls_verify=skip_tls_verify)
-        if len(content) > 25000:
-            content = content[:24600] + (
+        content = fetch_page(url, force_stealth=use_browser, skip_tls_verify=skip_tls_verify, max_chars=6000)
+        if len(content) > 6000:
+            content = content[:5700] + (
                 "\n\n> [!NOTE]\n"
-                f"> *Webpage content capped at 25,000 characters (truncated). Use `get_toc('{url}')` and `read_section` to read specific sections.*"
+                f"> *Webpage content capped at 6,000 characters to protect context window. Use `get_toc('{url}')` and `read_section` to inspect specific sections.*"
             )
         return content
 
 def _handle_get_toc(kwargs):
     with _FETCH_SEMAPHORE:
-        content = fetch_page(kwargs.get("url", ""))
+        content = fetch_page(kwargs.get("url", ""), max_chars=None)
         return get_table_of_contents(content)
 
 def _handle_read_section(kwargs):
     with _FETCH_SEMAPHORE:
-        content = fetch_page(kwargs.get("url", ""))
+        content = fetch_page(kwargs.get("url", ""), max_chars=None)
         return extract_section(content, kwargs.get("section_name_or_index", ""))
 
 def _handle_fast_neural_search(kwargs):
     with _ML_SEMAPHORE:
+        density = kwargs.get("density", "compact")
         data = fast_intelligent_search(
             kwargs.get("query", ""),
             max_results=kwargs.get("num_pages", 4),
             perspective=kwargs.get("perspective", "tech"),
-            instruction=kwargs.get("instruction") or None
+            instruction=kwargs.get("instruction") or None,
+            density=density
         )
-        return format_fast_digest(data)
+        return format_fast_digest(data, density=density)
 
 def _handle_batch_search(kwargs):
     queries = kwargs.get("queries") or []
@@ -135,11 +137,12 @@ def _handle_batch_search(kwargs):
     capped_queries = queries[:3]
     max_results_per_query = kwargs.get("max_results_per_query", 3)
     perspective = kwargs.get("perspective", "tech")
+    density = kwargs.get("density", "compact")
     outputs = []
     for idx, q in enumerate(capped_queries, 1):
         with _ML_SEMAPHORE:
-            data = fast_intelligent_search(q, max_results=max_results_per_query, perspective=perspective)
-            digest = format_fast_digest(data)
+            data = fast_intelligent_search(q, max_results=max_results_per_query, perspective=perspective, density=density)
+            digest = format_fast_digest(data, density=density)
             outputs.append(f"## Batch Query [{idx}/{len(capped_queries)}]: `{q}`\n\n{digest}")
     res_str = "\n\n========================================\n\n".join(outputs)
     if len(res_str) > 25000:

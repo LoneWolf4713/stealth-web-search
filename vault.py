@@ -17,9 +17,10 @@ os.makedirs(VAULT_DIR, exist_ok=True)
 VAULT_DB_PATH = os.path.join(VAULT_DIR, "vault.sqlite")
 
 def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(VAULT_DB_PATH, timeout=10.0)
+    conn = sqlite3.connect(VAULT_DB_PATH, timeout=30.0)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout = 30000;")
     return conn
 
 def init_vault():
@@ -58,8 +59,14 @@ def init_vault():
 
 init_vault()
 
+def _normalize_query(query: str) -> str:
+    """Normalize query by stripping whitespace, collapsing internal whitespace, and lowercasing."""
+    if not query:
+        return ""
+    return " ".join(query.strip().lower().split())
+
 def _hash(val: str) -> str:
-    return hashlib.sha256(val.strip().lower().encode("utf-8")).hexdigest()
+    return hashlib.sha256(_normalize_query(val).encode("utf-8")).hexdigest()
 
 def extract_domain(url: str) -> str:
     parsed = urlparse(url)
@@ -67,7 +74,8 @@ def extract_domain(url: str) -> str:
 
 # --- Search Cache ---
 def get_cached_search(query: str, max_age_hours: float = 12.0) -> Optional[List[Dict[str, Any]]]:
-    q_hash = _hash(query)
+    norm_q = _normalize_query(query)
+    q_hash = _hash(norm_q)
     now = time.time()
     try:
         with get_connection() as conn:
@@ -83,7 +91,8 @@ def get_cached_search(query: str, max_age_hours: float = 12.0) -> Optional[List[
     return None
 
 def set_cached_search(query: str, results: List[Dict[str, Any]], ttl_hours: float = 12.0):
-    q_hash = _hash(query)
+    norm_q = _normalize_query(query)
+    q_hash = _hash(norm_q)
     now = time.time()
     res_json = json.dumps(results)
     try:
@@ -91,7 +100,7 @@ def set_cached_search(query: str, results: List[Dict[str, Any]], ttl_hours: floa
             conn.execute("""
                 INSERT OR REPLACE INTO search_cache (query_hash, query_text, result_json, created_at, ttl_seconds)
                 VALUES (?, ?, ?, ?, ?)
-            """, (q_hash, query, res_json, now, ttl_hours * 3600))
+            """, (q_hash, norm_q, res_json, now, ttl_hours * 3600))
             conn.commit()
     except Exception:
         pass
