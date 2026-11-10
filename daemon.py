@@ -66,7 +66,7 @@ from parallel_pipeline import (
     format_deep_digest,
     format_manifest_card,
 )
-from vault import stage_document, inspect_staged_doc
+from vault import stage_document, inspect_staged_doc, record_fact, get_ledger_markdown, clear_ledger
 
 # Concurrency throttling: lives HERE now (not in each client process) since
 # this is the one place that actually touches the models/hardware.
@@ -189,6 +189,40 @@ def _handle_inspect_vault_doc(kwargs):
     max_chars = kwargs.get("max_chars", 1500)
     return inspect_staged_doc(doc_id=doc_id, query=query, section=section, max_chars=max_chars)
 
+def _handle_record_research_fact(kwargs):
+    category = kwargs.get("category", "")
+    tier = int(kwargs.get("tier", 1))
+    fact_text = kwargs.get("fact_text", "")
+    source_url = kwargs.get("source_url", "")
+    source_title = kwargs.get("source_title", "")
+    pass_num = int(kwargs.get("pass_num", 1))
+    tags = kwargs.get("tags") or []
+    fact_id = record_fact(
+        category=category,
+        tier=tier,
+        fact_text=fact_text,
+        source_url=source_url,
+        source_title=source_title,
+        pass_num=pass_num,
+        tags=tags
+    )
+    return f"Recorded fact #{fact_id} in category '{category}' (Tier {tier}, Pass {pass_num})."
+
+def _handle_get_research_ledger(kwargs):
+    category = kwargs.get("category") or None
+    tier = kwargs.get("tier")
+    if tier is not None:
+        try:
+            tier = int(tier)
+        except (ValueError, TypeError):
+            tier = None
+    return get_ledger_markdown(category=category, tier=tier)
+
+def _handle_clear_research_ledger(kwargs):
+    category = kwargs.get("category") or None
+    confirm = bool(kwargs.get("confirm", False))
+    return clear_ledger(category=category, confirm=confirm)
+
 HANDLERS = {
     "search": _handle_search,
     "fetch": _handle_fetch,
@@ -198,6 +232,9 @@ HANDLERS = {
     "batch_search": _handle_batch_search,
     "deep_reasoning_search": _handle_deep_reasoning_search,
     "inspect_vault_doc": _handle_inspect_vault_doc,
+    "record_research_fact": _handle_record_research_fact,
+    "get_research_ledger": _handle_get_research_ledger,
+    "clear_research_ledger": _handle_clear_research_ledger,
 }
 
 class _Handler(socketserver.StreamRequestHandler):

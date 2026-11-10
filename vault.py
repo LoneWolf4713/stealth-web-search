@@ -10,6 +10,8 @@ import hashlib
 import json
 import time
 import uuid
+from datetime import datetime, timezone
+from collections import defaultdict
 from urllib.parse import urlparse
 from typing import Optional, Dict, Any, List
 
@@ -76,6 +78,22 @@ def init_vault():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_staged_expires ON staged_documents(expires_at);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_staged_session ON staged_documents(session_id);")
         conn.execute("DELETE FROM staged_documents WHERE expires_at < ?", (time.time(),))
+
+        # Persistent Research State Ledger
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS research_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                tier INTEGER NOT NULL,
+                pass_num INTEGER NOT NULL,
+                fact_text TEXT NOT NULL,
+                source_url TEXT,
+                source_title TEXT,
+                tags_json TEXT NOT NULL,
+                created_at REAL NOT NULL
+            );
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ledger_cat_tier ON research_ledger(category, tier);")
         conn.commit()
 
 init_vault()
@@ -352,4 +370,166 @@ def inspect_staged_doc(
 ) -> str:
     """Convenience alias for extract_staged_slice."""
     return extract_staged_slice(doc_id=doc_id, query=query, section=section, max_chars=max_chars)
+
+
+# --- Persistent Research State Ledger ---
+
+def record_fact(
+    category: str,
+    tier: int,
+    fact_text: str,
+    source_url: str = "",
+    source_title: str = "",
+    pass_num: int = 1,
+    tags: Optional[List[str]] = None
+) -> int:
+    """
+    Record an established research fact or finding into the persistent SQLite ledger.
+    Returns the integer primary key of the inserted row.
+    """
+    tags_json = json.dumps(tags or [])
+    now = time.time()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO research_ledger (
+                category, tier, pass_num, fact_text, source_url, source_title, tags_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            category.strip(),
+            tier,
+            pass_num,
+            fact_text.strip(),
+            (source_url or "").strip(),
+            (source_title or "").strip(),
+            tags_json,
+            now
+        ))
+        conn.commit()
+        return cur.lastrowid
+
+
+def get_ledger_entries(
+    category: Optional[str] = None,
+    tier: Optional[int] = None
+) -> List[Dict[str, Any]]:
+    """
+    Query research ledger entries matching optional category and tier filters.
+    Ordered by category, tier, pass_num, created_at.
+    """
+    query = """
+        SELECT id, category, tier, pass_num, fact_text, source_url, source_title, tags_json, created_at
+        FROM research_ledger
+    """
+    params = []
+    conditions = []
+    if category is not None and category.strip():
+        conditions.append("category = ?")
+        params.append(category.strip())
+    if tier is not None:
+        conditions.append("tier = ?")
+        params.append(tier)
+
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " ORDER BY category ASC, tier ASC, pass_num ASC, created_at ASC"
+
+    entries = []
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(query, params)
+        for row in cur.fetchall():
+            tags = json.loads(row[7]) if row[7] else []
+            entries.append({
+                "id": row[0],
+                "category": row[1],
+                "tier": row[2],
+                "pass_num": row[3],
+                "fact_text": row[4],
+                "source_url": row[5],
+                "source_title": row[6],
+                "tags": tags,
+                "created_at": row[8],
+            })
+    return entries
+
+
+def get_ledger_markdown(
+    category: Optional[str] = None,
+    tier: Optional[int] = None
+) -> str:
+    """
+    Format facts into a concise, token-dense Markdown briefing grouped by # Category and ## Tier X.
+    Compact representation: bullet points with source link, date, tags.
+    Formatted specifically so an AI agent can inject this as the opening context for a fresh session
+    after flushing its conversational history.
+    """
+    entries = get_ledger_entries(category=category, tier=tier)
+    if not entries:
+        filter_desc = []
+        if category:
+            filter_desc.append(f"category='{category}'")
+        if tier is not None:
+            filter_desc.append(f"tier={tier}")
+        filter_str = f" for {', '.join(filter_desc)}" if filter_desc else ""
+        return f"No research facts recorded in ledger{filter_str}."
+
+    grouped = defaultdict(lambda: defaultdict(list))
+    for e in entries:
+        grouped[e["category"]][e["tier"]].append(e)
+
+    lines = ["# Research Ledger Briefing", f"*Established Facts: {len(entries)}*"]
+
+    for cat in sorted(grouped.keys()):
+        lines.append(f"\n# {cat}")
+        for t in sorted(grouped[cat].keys()):
+            lines.append(f"## Tier {t}")
+            for item in grouped[cat][t]:
+                src_parts = []
+                url = item.get("source_url", "")
+                title = item.get("source_title", "")
+                if url:
+                    label = title if title else (urlparse(url).netloc or "Source")
+                    src_parts.append(f"[{label}]({url})")
+
+                tags = item.get("tags", [])
+                tag_str = f" `[{', '.join(tags)}]`" if tags else ""
+
+                dt_str = datetime.fromtimestamp(item["created_at"], timezone.utc).strftime("%Y-%m-%d")
+
+                src_info = f" ({', '.join(src_parts)} | {dt_str})" if src_parts else f" ({dt_str})"
+                pass_info = f" [Pass {item['pass_num']}]" if item.get("pass_num") else ""
+
+                lines.append(f"- {item['fact_text']}{src_info}{tag_str}{pass_info}")
+
+    return "\n".join(lines)
+
+
+def clear_ledger(
+    category: Optional[str] = None,
+    confirm: bool = False
+) -> str:
+    """
+    Clear entries from the research ledger.
+    Requires confirm=True to execute delete.
+    If category is provided, clears only that category; otherwise clears all.
+    Returns count of deleted facts.
+    """
+    if not confirm:
+        return "Action aborted: confirm=True is required to clear research ledger entries."
+
+    with get_connection() as conn:
+        cur = conn.cursor()
+        if category and category.strip():
+            cat = category.strip()
+            cur.execute("DELETE FROM research_ledger WHERE category = ?", (cat,))
+            count = cur.rowcount
+            conn.commit()
+            return f"Cleared {count} facts from category '{cat}'."
+        else:
+            cur.execute("DELETE FROM research_ledger")
+            count = cur.rowcount
+            conn.commit()
+            return f"Cleared all {count} facts from the research ledger."
+
 

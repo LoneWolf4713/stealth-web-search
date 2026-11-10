@@ -198,5 +198,72 @@ def deep_reasoning_search(query: str, reasoning_intent: str = "", num_pages: int
         "deep_reasoning_search", query=query, reasoning_intent=reasoning_intent, num_pages=num_pages, perspective=perspective
     )
 
+@mcp.tool()
+def record_research_fact(
+    category: str,
+    tier: int,
+    fact_text: str,
+    source_url: str = "",
+    source_title: str = "",
+    pass_num: int = 1,
+    tags: list[str] = []
+) -> str:
+    """
+    Record an established research fact, finding, or milestone into the persistent SQLite research ledger.
+    
+    Context-Flushing Pattern for AI Agents:
+    During multi-pass or multi-category research loops (e.g. 10 categories x 5 tiers x 5 passes),
+    record your findings into this ledger as you go. When your context window grows large,
+    summarize progress, flush/clear conversational history, and call get_research_ledger to reload
+    all established state in a compact, token-dense briefing (<250 tokens) without context explosion.
+
+    Args:
+        category: Research domain or topic category (e.g. 'architecture', 'benchmarks', 'security').
+        tier: Depth or importance tier (e.g. 1 = core/foundational, 2 = architecture, 3 = edge cases).
+        fact_text: Concise, concrete statement of fact or key conclusion.
+        source_url: URL where the fact was verified.
+        source_title: Optional human-readable title of the source.
+        pass_num: Research pass iteration number (default: 1).
+        tags: Optional list of keyword tags for filtering and indexing.
+    """
+    return daemon_request(
+        "record_research_fact",
+        category=category,
+        tier=tier,
+        fact_text=fact_text,
+        source_url=source_url,
+        source_title=source_title,
+        pass_num=pass_num,
+        tags=tags
+    )
+
+@mcp.tool()
+def get_research_ledger(category: str = None, tier: int = None) -> str:
+    """
+    Retrieve established research facts from the persistent SQLite ledger as a token-dense Markdown briefing.
+    
+    Context-Flushing Pattern for AI Agents:
+    Call this tool at the start of a fresh conversation session after flushing conversational history.
+    It returns a structured, categorized briefing grouped by # Category and ## Tier that provides
+    all accumulated research state in under 250 tokens for immediate reasoning without context bloat.
+
+    Args:
+        category: Optional category filter. If omitted, returns facts across all categories.
+        tier: Optional tier filter. If omitted, returns facts across all tiers.
+    """
+    return daemon_request("get_research_ledger", category=category, tier=tier)
+
+@mcp.tool()
+def clear_research_ledger(category: str = None, confirm: bool = False) -> str:
+    """
+    Clear research ledger entries from the SQLite database.
+    Requires confirm=True to prevent accidental data loss.
+
+    Args:
+        category: Optional category to clear. If omitted, clears all entries in the ledger.
+        confirm: Confirmation flag. Must be set to True to execute deletion.
+    """
+    return daemon_request("clear_research_ledger", category=category, confirm=confirm)
+
 if __name__ == "__main__":
     mcp.run()

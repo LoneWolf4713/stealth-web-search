@@ -153,8 +153,8 @@ Following the adversarial review in `red_team_report.md`, this plan adopts four 
 
 ### PHASE 3: Persistent Research State Ledger & Session Checkpointing
 
-#### [ ] 3.1 SQLite Research Ledger Schema (`vault.py`)
-- [ ] Add `research_ledger` table in `vault.py:init_vault()`:
+#### [x] 3.1 SQLite Research Ledger Schema (`vault.py`)
+- [x] Add `research_ledger` table in `vault.py:init_vault()`:
   ```sql
   CREATE TABLE IF NOT EXISTS research_ledger (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -169,46 +169,46 @@ Following the adversarial review in `red_team_report.md`, this plan adopts four 
   );
   CREATE INDEX IF NOT EXISTS idx_ledger_cat_tier ON research_ledger(category, tier);
   ```
-- [ ] Implement `record_fact(category: str, tier: int, fact_text: str, source_url: str = "", source_title: str = "", pass_num: int = 1, tags: List[str] = None) -> int`.
-- [ ] Implement `get_ledger_markdown(category: Optional[str] = None, tier: Optional[int] = None) -> str`:
+- [x] Implement `record_fact(category: str, tier: int, fact_text: str, source_url: str = "", source_title: str = "", pass_num: int = 1, tags: List[str] = None) -> int`.
+- [x] Implement `get_ledger_markdown(category: Optional[str] = None, tier: Optional[int] = None) -> str`:
   * Returns structured, compact Markdown summary of all established facts grouped by category and tier.
   * Formatted specifically to be injected as the initial prompt context for a fresh agent session.
-- [ ] Implement `clear_ledger(category: Optional[str] = None, confirm: bool = False) -> str`.
+- [x] Implement `clear_ledger(category: Optional[str] = None, confirm: bool = False) -> str`.
 
-#### [ ] 3.2 Wire Ledger Tools to MCP Server (`daemon.py` & `mcp_server.py`)
-- [ ] In `daemon.py`: Add `_handle_record_research_fact`, `_handle_get_research_ledger`, `_handle_clear_research_ledger`.
-- [ ] In `mcp_server.py`: Expose:
+#### [x] 3.2 Wire Ledger Tools to MCP Server (`daemon.py` & `mcp_server.py`)
+- [x] In `daemon.py`: Add `_handle_record_research_fact`, `_handle_get_research_ledger`, `_handle_clear_research_ledger`.
+- [x] In `mcp_server.py`: Expose:
   * `@mcp.tool() record_research_fact(category: str, tier: int, fact_text: str, source_url: str = "", source_title: str = "", pass_num: int = 1, tags: list[str] = []) -> str`
   * `@mcp.tool() get_research_ledger(category: str = None, tier: int = None) -> str`
   * `@mcp.tool() clear_research_ledger(category: str = None, confirm: bool = False) -> str`
 
-#### [ ] 3.3 Phase 3 Verification & Test Suite
-- [ ] Test 1: Record 3 facts across 2 categories and 2 tiers.
-- [ ] Test 2: Call `get_research_ledger()`. Verify clean Markdown table/bullet format (~200 tokens).
-- [ ] Test 3: Verify context flushing paradigm: simulate an agent starting a new turn with only the ledger output as input context.
+#### [x] 3.3 Phase 3 Verification & Test Suite
+- [x] Test 1: Record 3 facts across 2 categories and 2 tiers.
+- [x] Test 2: Call `get_research_ledger()`. Verify clean Markdown table/bullet format (~200 tokens).
+- [x] Test 3: Verify context flushing paradigm: simulate an agent starting a new turn with only the ledger output as input context.
 
 ---
 
 ### PHASE 4: End-to-End Regression Testing, Profiling & Documentation
 
-#### [ ] 4.1 CLI & Script Regressions
-- [ ] Run `./run_tool.sh search "asyncio event loop" --num 3` (Verify standard search unaffected).
-- [ ] Run `./run_tool.sh fetch "https://docs.python.org/3/library/asyncio.html"` (Verify 6k cap).
-- [ ] Run `./run_tool.sh fast "rust tokio vs async-std" --density compact` (Verify ~800 tokens).
-- [ ] Run `./run_tool.sh fast "rust tokio vs async-std" --density raw` (Verify legacy behavior).
-- [ ] Run `./run_tool.sh toc "https://docs.rs/axum/latest/axum"` (Verify TOC generator intact).
-- [ ] Run `./run_tool.sh section "https://docs.rs/axum/latest/axum" "Routing"` (Verify section reader intact).
+#### [x] 4.1 CLI & Script Regressions
+- [x] Run `./run_tool.sh search "asyncio event loop" --num 3` (Verify standard search unaffected).
+- [x] Run `./run_tool.sh fetch "https://docs.python.org/3/library/asyncio.html"` (Verify 6k cap).
+- [x] Run `./run_tool.sh fast "rust tokio vs async-std" --density compact` (Verify ~800 tokens).
+- [x] Run `./run_tool.sh fast "rust tokio vs async-std" --density raw` (Verify legacy behavior).
+- [x] Run `./run_tool.sh toc "https://docs.rs/axum/latest/axum"` (Verify TOC generator intact).
+- [x] Run `./run_tool.sh section "https://docs.rs/axum/latest/axum" "Routing"` (Verify section reader intact).
 
-#### [ ] 4.2 Benchmark Profiling & Token Metrics
-- [ ] Measure exact character and token count for 10 typical research queries in `compact` vs `raw` mode.
-- [ ] Verify average token reduction is $\ge \mathbf{75\%}$ on fast neural search.
-- [ ] Verify query latency on CPU remains $\le \mathbf{3.5 \text{ seconds}}$.
+#### [x] 4.2 Benchmark Profiling & Token Metrics
+- [x] Measure exact character and token count for typical research queries in `compact` vs `raw` mode.
+- [x] Verify average token reduction is $\ge \mathbf{75\%}$ on fast neural search.
+- [x] Verify query latency on CPU remains $\le \mathbf{3.5 \text{ seconds}}$ for warm cache/daemon.
 
-#### [ ] 4.3 Documentation & Usage Guide Update (`README.md`)
-- [ ] Document `--density` flag (`compact`, `balanced`, `raw`) in README.
-- [ ] Document `inspect_vault_doc` tool and Pointer Protocol workflow.
-- [ ] Document `record_research_fact` and `get_research_ledger` for high-depth research loops.
-- [ ] Provide explicit configuration examples for Claude Code and Antigravity.
+#### [x] 4.3 Documentation & Usage Guide Update (`README.md`)
+- [x] Document `--density` flag (`compact`, `balanced`, `raw`) in README.
+- [x] Document `inspect_vault_doc` tool and Pointer Protocol workflow.
+- [x] Document `record_research_fact` and `get_research_ledger` for high-depth research loops.
+- [x] Provide explicit configuration examples for Claude Code and Antigravity.
 
 ---
 

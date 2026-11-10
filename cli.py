@@ -172,5 +172,45 @@ def batch(
         if idx < len(queries):
             print("\n" + "=" * 50 + "\n")
 
+@app.command("record-fact")
+def record_fact_cmd(
+    category: str = typer.Argument(..., help="Research category (e.g. architecture, benchmarks)"),
+    fact: str = typer.Argument(..., help="Fact text or established finding"),
+    tier: int = typer.Option(1, "--tier", "-t", help="Depth tier (1=foundational, 2=deep, 3=edge)"),
+    source: str = typer.Option("", "--source", "-s", help="Source URL"),
+    title: str = typer.Option("", "--title", help="Source title"),
+    pass_num: int = typer.Option(1, "--pass", "-p", help="Research pass number"),
+    tag: list[str] = typer.Option([], "--tag", help="Keyword tags (can be repeated)"),
+):
+    """Record an established fact into the persistent research ledger."""
+    from daemon_client import daemon_request
+    res = daemon_request(
+        "record_research_fact",
+        category=category,
+        tier=tier,
+        fact_text=fact,
+        source_url=source,
+        source_title=title,
+        pass_num=pass_num,
+        tags=list(tag) if tag else []
+    )
+    console.print(f"[bold green]{res}[/bold green]")
+
+@app.command("ledger")
+def ledger_cmd(
+    category: str = typer.Option("", "--category", "-c", help="Filter by research category"),
+    tier: int = typer.Option(None, "--tier", "-t", help="Filter by tier"),
+    clear: bool = typer.Option(False, "--clear", help="Clear ledger entries"),
+    confirm: bool = typer.Option(False, "--confirm", help="Confirm deletion when clearing"),
+):
+    """View or manage the persistent research ledger briefing."""
+    from daemon_client import daemon_request
+    if clear:
+        res = daemon_request("clear_research_ledger", category=category or None, confirm=confirm)
+        console.print(res)
+    else:
+        res = daemon_request("get_research_ledger", category=category or None, tier=tier)
+        print(res)
+
 if __name__ == "__main__":
     app()
