@@ -88,8 +88,8 @@ Following the adversarial review in `red_team_report.md`, this plan adopts four 
 
 ### PHASE 2: Multi-Client Out-of-Band Staging & Pointer Protocol
 
-#### [ ] 2.1 SQLite Staging Schema & Management (`vault.py`)
-- [ ] Add `staged_documents` table in `vault.py:init_vault()`:
+#### [x] 2.1 SQLite Staging Schema & Management (`vault.py`)
+- [x] Add `staged_documents` table in `vault.py:init_vault()`:
   ```sql
   CREATE TABLE IF NOT EXISTS staged_documents (
       doc_id TEXT PRIMARY KEY,
@@ -106,33 +106,33 @@ Following the adversarial review in `red_team_report.md`, this plan adopts four 
   CREATE INDEX IF NOT EXISTS idx_staged_expires ON staged_documents(expires_at);
   CREATE INDEX IF NOT EXISTS idx_staged_session ON staged_documents(session_id);
   ```
-- [ ] Implement `stage_document(url: str, title: str, content: str, session_id: str = "default", ttl_days: float = 7.0) -> Dict[str, Any]`:
+- [x] Implement `stage_document(url: str, title: str, content: str, session_id: str = "default", ttl_days: float = 7.0) -> Dict[str, Any]`:
   * Generate UUID-based ID: `doc_` + `uuid.uuid4().hex[:12]`.
   * Extract TOC outline using `chunker.extract_headings(content)`.
   * Insert or replace into `staged_documents`.
   * Return metadata dict: `{doc_id, url, title, char_count, token_count, headings}`.
-- [ ] Implement `get_staged_document(doc_id: str) -> Optional[Dict[str, Any]]`:
+- [x] Implement `get_staged_document(doc_id: str) -> Optional[Dict[str, Any]]`:
   * Query by `doc_id`. Check `time.time() < expires_at`.
   * Return document dict or `None` if expired / not found.
-- [ ] Implement `clean_expired_staged_docs()` to purge records where `expires_at < now`.
+- [x] Implement `clean_expired_staged_docs()` to purge records where `expires_at < now`.
 
-#### [ ] 2.2 Section & Query Slice Extraction (`vault.py` & `chunker.py`)
-- [ ] Implement `extract_staged_slice(doc_id: str, query: str = "", section: str = "", max_chars: int = 1500) -> str`:
+#### [x] 2.2 Section & Query Slice Extraction (`vault.py` & `chunker.py`)
+- [x] Implement `extract_staged_slice(doc_id: str, query: str = "", section: str = "", max_chars: int = 1500) -> str`:
   * Fetch doc from `vault.py`. If missing/expired, return clean error:
     `"Error: Document {doc_id} not found or expired. Please re-fetch the original URL."`
   * If `section` specified: call `chunker.extract_section(content, section)`.
   * If `query` specified: run lightweight keyword/regex scan for best paragraph containing query terms.
   * Cap returned text at `max_chars` (default 1,500 chars / ~350 tokens) with clear offset indicator.
 
-#### [ ] 2.3 Implement `inspect_vault_doc` Across the 4-File Pipeline
-- [ ] In `vault.py`: Expose `inspect_staged_doc(doc_id: str, query: str = "", section: str = "", max_chars: int = 1500) -> str`.
-- [ ] In `daemon.py`: Add `_handle_inspect_vault_doc(kwargs)` to `HANDLERS`.
-- [ ] In `daemon_client.py`: Ensure `daemon_request("inspect_vault_doc", ...)` routes seamlessly.
-- [ ] In `mcp_server.py`: Register `@mcp.tool() inspect_vault_doc(doc_id: str, query: str = "", section: str = "", max_chars: int = 1500) -> str`.
+#### [x] 2.3 Implement `inspect_vault_doc` Across the 4-File Pipeline
+- [x] In `vault.py`: Expose `inspect_staged_doc(doc_id: str, query: str = "", section: str = "", max_chars: int = 1500) -> str`.
+- [x] In `daemon.py`: Add `_handle_inspect_vault_doc(kwargs)` to `HANDLERS`.
+- [x] In `daemon_client.py`: Ensure `daemon_request("inspect_vault_doc", ...)` routes seamlessly.
+- [x] In `mcp_server.py`: Register `@mcp.tool() inspect_vault_doc(doc_id: str, query: str = "", section: str = "", max_chars: int = 1500) -> str`.
   * Add clear docstring instructing the LLM on how to inspect staged documents.
 
-#### [ ] 2.4 Pointer Manifest Card Generator
-- [ ] Implement helper `format_manifest_card(staged_meta: Dict[str, Any], lead_snippet: str = "") -> str`:
+#### [x] 2.4 Pointer Manifest Card Generator
+- [x] Implement helper `format_manifest_card(staged_meta: Dict[str, Any], lead_snippet: str = "") -> str`:
   ```markdown
   ### 📄 [Staged Document: {doc_id}] {title}
   * **Source**: {url}
@@ -141,13 +141,13 @@ Following the adversarial review in `red_team_report.md`, this plan adopts four 
   * **Lead Snippet**: {lead_snippet}
   * **How to Read**: Call `inspect_vault_doc('{doc_id}', section='...')` or `inspect_vault_doc('{doc_id}', query='...')` to pull targeted excerpts without filling context.
   ```
-- [ ] In `daemon.py:_handle_fetch()`, add support for `as_pointer: bool = False`. If True, stages document and returns the manifest card (~120 tokens).
+- [x] In `daemon.py:_handle_fetch()`, add support for `as_pointer: bool = False`. If True, stages document and returns the manifest card (~120 tokens).
 
-#### [ ] 2.5 Phase 2 Verification & Test Suite
-- [ ] Test 1: Stage a document via daemon client. Verify row exists in `staged_documents` in `vault.sqlite`.
-- [ ] Test 2: Call `inspect_vault_doc` with valid `doc_id` and `section="Routing"`. Verify targeted section returns in <15ms.
-- [ ] Test 3: Call `inspect_vault_doc` with an invalid/expired ID. Verify clean, non-crashing error message.
-- [ ] Test 4: Verify multi-client safety: ensure concurrent calls with different session IDs generate unique collision-free `doc_id`s.
+#### [x] 2.5 Phase 2 Verification & Test Suite
+- [x] Test 1: Stage a document via daemon client. Verify row exists in `staged_documents` in `vault.sqlite`.
+- [x] Test 2: Call `inspect_vault_doc` with valid `doc_id` and `section="Routing"`. Verify targeted section returns in <15ms.
+- [x] Test 3: Call `inspect_vault_doc` with an invalid/expired ID. Verify clean, non-crashing error message.
+- [x] Test 4: Verify multi-client safety: ensure concurrent calls with different session IDs generate unique collision-free `doc_id`s.
 
 ---
 

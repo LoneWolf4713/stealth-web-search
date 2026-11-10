@@ -60,11 +60,16 @@ def fetch(
     force_stealth: bool = typer.Option(False, "--browser", "-b", help="Use browser rendering"),
     no_cache: bool = typer.Option(False, "--no-cache", help="Bypass SQLite cache"),
     skip_tls_verify: bool = typer.Option(True, "--skip-tls-verify/--verify-tls", help="Bypass TLS certificate verification"),
+    as_pointer: bool = typer.Option(False, "--pointer", "-p", help="Stage document out-of-band and return manifest card"),
     output_file: str = typer.Option("", "--out", "-o", help="Save markdown to file")
 ):
     """Fetch any webpage or PDF document and convert to Markdown format."""
     console.print(f"[dim]Fetching {url}...[/dim]")
-    content = fetch_page(url, force_stealth=force_stealth, use_cache=not no_cache, skip_tls_verify=skip_tls_verify)
+    if as_pointer:
+        from daemon_client import daemon_request
+        content = daemon_request("fetch", url=url, force_browser=force_stealth, skip_tls_verify=skip_tls_verify, as_pointer=True)
+    else:
+        content = fetch_page(url, force_stealth=force_stealth, use_cache=not no_cache, skip_tls_verify=skip_tls_verify)
     
     if output_file:
         with open(output_file, "w", encoding="utf-8") as f:
@@ -72,6 +77,18 @@ def fetch(
         console.print(f"[bold green]Saved to {output_file}[/bold green]")
     else:
         print(content)
+
+@app.command("inspect")
+def inspect_cmd(
+    doc_id: str = typer.Argument(..., help="Document ID in vault (e.g. doc_123456789abc)"),
+    section: str = typer.Option("", "--section", "-s", help="Section heading or numeric index"),
+    query: str = typer.Option("", "--query", "-q", help="Query keywords or phrase"),
+    max_chars: int = typer.Option(1500, "--max-chars", "-m", help="Maximum characters to return")
+):
+    """Inspect a section or query keywords inside a staged document in the vault."""
+    from daemon_client import daemon_request
+    res = daemon_request("inspect_vault_doc", doc_id=doc_id, query=query, section=section, max_chars=max_chars)
+    print(res)
 
 @app.command()
 def toc(

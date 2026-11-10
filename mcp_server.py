@@ -50,7 +50,13 @@ def search(query: str, max_results: int = 5, perspective: str = "tech") -> str:
     return daemon_request("search", query=query, max_results=max_results, perspective=perspective)
 
 @mcp.tool()
-def fetch(url: str, force_browser: bool = False, force_stealth: bool = False, skip_tls_verify: bool = True) -> str:
+def fetch(
+    url: str,
+    force_browser: bool = False,
+    force_stealth: bool = False,
+    skip_tls_verify: bool = True,
+    as_pointer: bool = False
+) -> str:
     """
     Fetch the content of a webpage or PDF document and convert it to clean, readable Markdown format.
     Automatically parses PDF documents, handles SSL certificates, and escalates to browser mode for dynamic pages.
@@ -60,10 +66,32 @@ def fetch(url: str, force_browser: bool = False, force_stealth: bool = False, sk
         force_browser: Set to True to use browser rendering for dynamic JavaScript pages.
         force_stealth: Legacy alias for force_browser.
         skip_tls_verify: Set to True (default) to bypass invalid or self-signed TLS certificates (e.g. academic sites).
+        as_pointer: Set to True to stage the full document out-of-band in the vault and receive a compact
+            manifest pointer card (~120 tokens) instead of reading the entire webpage into context. Use
+            inspect_vault_doc to selectively inspect sections or query keywords within staged documents.
     """
     return daemon_request(
-        "fetch", url=url, force_browser=force_browser, force_stealth=force_stealth, skip_tls_verify=skip_tls_verify
+        "fetch",
+        url=url,
+        force_browser=force_browser,
+        force_stealth=force_stealth,
+        skip_tls_verify=skip_tls_verify,
+        as_pointer=as_pointer
     )
+
+@mcp.tool()
+def inspect_vault_doc(doc_id: str, query: str = "", section: str = "", max_chars: int = 1500) -> str:
+    """
+    Inspect a specific section or search for keywords inside a document previously staged in the vault.
+    Returns a small, focused excerpt (~350 tokens) instead of reading the entire webpage into context.
+
+    Args:
+        doc_id: The document identifier (e.g. 'doc_7a9f2b8c1d3e') returned in a document manifest.
+        query: Optional search keyword or phrase to locate within the document.
+        section: Optional section heading name or index number (from document TOC).
+        max_chars: Maximum characters to return (default: 1500).
+    """
+    return daemon_request("inspect_vault_doc", doc_id=doc_id, query=query, section=section, max_chars=max_chars)
 
 @mcp.tool()
 def get_toc(url: str) -> str:

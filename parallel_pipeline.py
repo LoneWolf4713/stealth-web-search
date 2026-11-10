@@ -510,6 +510,52 @@ def format_deep_digest(data: Dict[str, Any]) -> str:
 
     return full_output
 
+def format_manifest_card(staged_meta: Dict[str, Any], lead_snippet: str = "") -> str:
+    """
+    Generate a compact, token-efficient (~120 tokens) pointer manifest card for a staged document.
+    Enables out-of-band document storage with targeted in-band inspection.
+    """
+    doc_id = staged_meta.get("doc_id", "")
+    title = staged_meta.get("title", "") or "Untitled Document"
+    url = staged_meta.get("url", "")
+    token_count = staged_meta.get("token_count", 0)
+    char_count = staged_meta.get("char_count", 0)
+    headings = staged_meta.get("headings", [])
+
+    if headings:
+        heading_titles = [h.get("title") for h in headings if isinstance(h, dict) and h.get("title")]
+        if heading_titles:
+            cleaned_titles = [t.lstrip("§ \t-#*") for t in heading_titles]
+            cleaned_titles = [t for t in cleaned_titles if t]
+            if len(cleaned_titles) <= 6:
+                sections_summary = ", ".join(f"`{t}`" for t in cleaned_titles)
+            else:
+                sections_summary = ", ".join(f"`{t}`" for t in cleaned_titles[:6]) + f" (+{len(cleaned_titles) - 6} more)"
+        else:
+            sections_summary = "None (unstructured document)"
+    else:
+        sections_summary = "None (unstructured document)"
+
+    if not lead_snippet:
+        raw_content = staged_meta.get("content_markdown") or staged_meta.get("content", "")
+        # Find first non-empty, non-heading paragraph
+        lines = [l.strip() for l in raw_content.split("\n") if l.strip() and not l.strip().startswith("#")]
+        if lines:
+            lead_snippet = lines[0]
+            if len(lead_snippet) > 140:
+                lead_snippet = lead_snippet[:137] + "..."
+        else:
+            lead_snippet = "No lead snippet available."
+
+    return (
+        f"### 📄 [Staged Document: {doc_id}] {title}\n"
+        f"* **Source**: {url}\n"
+        f"* **Total Size**: ~{token_count:,} tokens ({char_count:,} chars) [Stored Out-of-Band in Vault]\n"
+        f"* **Available Sections**: {sections_summary}\n"
+        f"* **Lead Finding**: {lead_snippet}\n"
+        f"* **How to Inspect**: Call `inspect_vault_doc('{doc_id}', section='...')` or `inspect_vault_doc('{doc_id}', query='...')` to pull targeted excerpts without filling context."
+    )
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: parallel_pipeline.py <query> [max_results]")

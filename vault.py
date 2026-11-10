@@ -9,8 +9,11 @@ import sqlite3
 import hashlib
 import json
 import time
+import uuid
 from urllib.parse import urlparse
 from typing import Optional, Dict, Any, List
+
+from chunker import extract_headings, extract_section, find_query_passages
 
 VAULT_DIR = os.path.expanduser("~/.cache/web_search_tool")
 os.makedirs(VAULT_DIR, exist_ok=True)
@@ -55,6 +58,24 @@ def init_vault():
                 ttl_seconds REAL NOT NULL
             );
         """)
+        # Staged documents for out-of-band context reduction & pointer protocol
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS staged_documents (
+                doc_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                url TEXT NOT NULL,
+                title TEXT NOT NULL,
+                content_markdown TEXT NOT NULL,
+                toc_json TEXT NOT NULL,
+                char_count INTEGER NOT NULL,
+                token_count INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                expires_at REAL NOT NULL
+            );
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_staged_expires ON staged_documents(expires_at);")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_staged_session ON staged_documents(session_id);")
+        conn.execute("DELETE FROM staged_documents WHERE expires_at < ?", (time.time(),))
         conn.commit()
 
 init_vault()
@@ -174,3 +195,161 @@ def save_domain_cookies(url_or_domain: str, cookies: Dict[str, str], user_agent:
             conn.commit()
     except Exception:
         pass
+
+# --- Out-of-Band Staging & Pointer Protocol ---
+
+def stage_document(
+    url: str,
+    title: str,
+    content: str,
+    session_id: str = "default",
+    ttl_days: float = 7.0
+) -> Dict[str, Any]:
+    """
+    Stage a full document out-of-band in the vault.
+    Generates a unique collision-free doc_id and stores TOC metadata.
+    """
+    doc_id = f"doc_{uuid.uuid4().hex[:12]}"
+    headings = extract_headings(content)
+    char_count = len(content)
+    token_count = int(char_count / 4.2)
+    now = time.time()
+    expires_at = now + (ttl_days * 86400.0)
+    toc_json = json.dumps(headings)
+
+    with get_connection() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO staged_documents (
+                doc_id, session_id, url, title, content_markdown, toc_json,
+                char_count, token_count, created_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            doc_id, session_id, url, title, content, toc_json,
+            char_count, token_count, now, expires_at
+        ))
+        conn.commit()
+
+    return {
+        "doc_id": doc_id,
+        "session_id": session_id,
+        "url": url,
+        "title": title,
+        "char_count": char_count,
+        "token_count": token_count,
+        "headings": headings,
+        "content_markdown": content,
+        "content": content,
+        "created_at": now,
+        "expires_at": expires_at,
+    }
+
+def get_staged_document(doc_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetch a staged document from the vault by doc_id.
+    Returns None if missing or expired.
+    """
+    now = time.time()
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT doc_id, session_id, url, title, content_markdown, toc_json,
+                       char_count, token_count, created_at, expires_at
+                FROM staged_documents WHERE doc_id = ?
+            """, (doc_id,))
+            row = cur.fetchone()
+            if row:
+                (d_id, session_id, url, title, content, toc_json,
+                 char_count, token_count, created_at, expires_at) = row
+                if now > expires_at:
+                    return None
+                headings = json.loads(toc_json) if toc_json else []
+                return {
+                    "doc_id": d_id,
+                    "session_id": session_id,
+                    "url": url,
+                    "title": title,
+                    "content_markdown": content,
+                    "content": content,
+                    "toc_json": toc_json,
+                    "headings": headings,
+                    "char_count": char_count,
+                    "token_count": token_count,
+                    "created_at": created_at,
+                    "expires_at": expires_at,
+                }
+    except Exception:
+        pass
+    return None
+
+def clean_expired_staged_docs() -> int:
+    """Purge expired staged documents from the vault."""
+    now = time.time()
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM staged_documents WHERE expires_at < ?", (now,))
+            conn.commit()
+            return cur.rowcount
+    except Exception:
+        return 0
+
+def extract_staged_slice(
+    doc_id: str,
+    query: str = "",
+    section: str = "",
+    max_chars: int = 1500
+) -> str:
+    """
+    Extract a targeted slice (by section heading/index or query keywords) from a staged document.
+    Enforces max_chars ceiling with clean truncation indicator.
+    """
+    doc = get_staged_document(doc_id)
+    if not doc:
+        return f"Error: Document '{doc_id}' was not found or has expired (7-day TTL). Please re-fetch the document from its original URL."
+
+    content = doc.get("content_markdown") or doc.get("content", "")
+    headings = doc.get("headings", [])
+
+    def apply_truncation(text: str, limit: int) -> str:
+        if len(text) > limit:
+            indicator = f"\n\n... [Content truncated at {limit} chars. Use `inspect_vault_doc` with a specific section or query for more.]"
+            return text[:max(0, limit - len(indicator))] + indicator
+        return text
+
+    # Case 1: Specific section requested
+    if section and section.strip():
+        sec_clean = section.strip()
+        sec_text = extract_section(content, sec_clean)
+        if not sec_text.startswith(f"Section '{sec_clean}' not found"):
+            # Section found. If query is also provided and section is long, focus on query inside section
+            if query and query.strip() and len(sec_text) > max_chars:
+                q_passages = find_query_passages(sec_text, query.strip(), max_chars=max_chars)
+                if q_passages:
+                    return apply_truncation(q_passages, max_chars)
+            return apply_truncation(sec_text, max_chars)
+        else:
+            # Section not found. If query provided, fallback to query search across full document
+            if not (query and query.strip()):
+                return sec_text
+
+    # Case 2: Query requested (or fallback from section not found)
+    if query and query.strip():
+        q_passages = find_query_passages(content, query.strip(), max_chars=max_chars)
+        if q_passages:
+            return apply_truncation(q_passages, max_chars)
+        sections_summary = ", ".join(f"`{h['title']}`" for h in headings[:8]) if headings else "None"
+        return f"No passages found matching query '{query}' in document '{doc_id}'. Available sections: {sections_summary}."
+
+    # Case 3: Neither section nor query provided: return beginning of document
+    return apply_truncation(content, max_chars)
+
+def inspect_staged_doc(
+    doc_id: str,
+    query: str = "",
+    section: str = "",
+    max_chars: int = 1500
+) -> str:
+    """Convenience alias for extract_staged_slice."""
+    return extract_staged_slice(doc_id=doc_id, query=query, section=section, max_chars=max_chars)
+

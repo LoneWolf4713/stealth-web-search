@@ -54,15 +54,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ws_daemon")
 
+from urllib.parse import urlparse
+
 from searcher import search_web
 from fetcher import fetch_page
-from chunker import get_table_of_contents, extract_section
+from chunker import get_table_of_contents, extract_section, extract_headings
 from parallel_pipeline import (
     fast_intelligent_search,
     format_fast_digest,
     deep_reasoning_search,
     format_deep_digest,
+    format_manifest_card,
 )
+from vault import stage_document, inspect_staged_doc
 
 # Concurrency throttling: lives HERE now (not in each client process) since
 # this is the one place that actually touches the models/hardware.
@@ -100,6 +104,25 @@ def _handle_fetch(kwargs):
         url = kwargs.get("url", "")
         use_browser = kwargs.get("force_browser", False) or kwargs.get("force_stealth", False)
         skip_tls_verify = kwargs.get("skip_tls_verify", True)
+        as_pointer = kwargs.get("as_pointer", False)
+        session_id = kwargs.get("session_id", "default")
+
+        if as_pointer:
+            # Out-of-band staging: fetch full document uncapped
+            content = fetch_page(url, force_stealth=use_browser, skip_tls_verify=skip_tls_verify, max_chars=None)
+            if content.startswith(f"Failed to retrieve {url}:"):
+                return content
+
+            headings = extract_headings(content)
+            title = headings[0]["title"] if headings else (urlparse(url).netloc or url)
+            staged_meta = stage_document(
+                url=url,
+                title=title,
+                content=content,
+                session_id=session_id
+            )
+            return format_manifest_card(staged_meta)
+
         content = fetch_page(url, force_stealth=use_browser, skip_tls_verify=skip_tls_verify, max_chars=6000)
         if len(content) > 6000:
             content = content[:5700] + (
@@ -159,6 +182,13 @@ def _handle_deep_reasoning_search(kwargs):
         )
         return format_deep_digest(data)
 
+def _handle_inspect_vault_doc(kwargs):
+    doc_id = kwargs.get("doc_id", "")
+    query = kwargs.get("query", "")
+    section = kwargs.get("section", "")
+    max_chars = kwargs.get("max_chars", 1500)
+    return inspect_staged_doc(doc_id=doc_id, query=query, section=section, max_chars=max_chars)
+
 HANDLERS = {
     "search": _handle_search,
     "fetch": _handle_fetch,
@@ -167,6 +197,7 @@ HANDLERS = {
     "fast_neural_search": _handle_fast_neural_search,
     "batch_search": _handle_batch_search,
     "deep_reasoning_search": _handle_deep_reasoning_search,
+    "inspect_vault_doc": _handle_inspect_vault_doc,
 }
 
 class _Handler(socketserver.StreamRequestHandler):

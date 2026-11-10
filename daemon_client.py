@@ -23,12 +23,18 @@ REQUEST_TIMEOUT_SECONDS = 180
 
 _spawn_lock = threading.Lock()
 
+def _get_python_exec():
+    venv_py = os.path.join(SCRIPT_DIR, ".venv", "bin", "python")
+    if os.path.isfile(venv_py) and os.access(venv_py, os.X_OK):
+        return venv_py
+    return sys.executable
+
 def _spawn_daemon():
     with _spawn_lock:
         try:
             with open(DAEMON_OUT_LOG, "a") as log_f:
                 subprocess.Popen(
-                    [sys.executable, DAEMON_SCRIPT],
+                    [_get_python_exec(), DAEMON_SCRIPT],
                     stdout=log_f,
                     stderr=subprocess.STDOUT,
                     stdin=subprocess.DEVNULL,

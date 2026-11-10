@@ -307,3 +307,100 @@ def chunk_markdown_smart(
         deduped_chunks.append(c)
 
     return deduped_chunks
+
+def find_query_passages(markdown: str, query: str, max_chars: int = 1500) -> str:
+    """
+    Search markdown for the most relevant paragraph(s) containing query keywords.
+    Preserves code blocks and Markdown structures without breaking syntax.
+    Enforces max_chars limit with clean truncation if necessary.
+    """
+    if not markdown:
+        return ""
+    if not query or not query.strip():
+        if len(markdown) > max_chars:
+            trunc_msg = f"\n\n... [Content truncated at {max_chars} chars.]"
+            return markdown[:max(0, max_chars - len(trunc_msg))] + trunc_msg
+        return markdown
+
+    query_clean = query.strip()
+    q_terms = [w.lower() for w in re.findall(r'[\w\-]+', query_clean) if len(w) > 1]
+    if not q_terms:
+        if len(markdown) > max_chars:
+            trunc_msg = f"\n\n... [Content truncated at {max_chars} chars.]"
+            return markdown[:max(0, max_chars - len(trunc_msg))] + trunc_msg
+        return markdown
+
+    # Protect code blocks
+    code_blocks = []
+    def save_code(m):
+        code_blocks.append(m.group(0))
+        return f"__CODE_BLOCK_SLOT_{len(code_blocks)-1}__"
+
+    masked = CODE_BLOCK_PATTERN.sub(save_code, markdown)
+    raw_paras = [p.strip() for p in re.split(r'\n{2,}', masked) if p.strip()]
+
+    def restore_code(text: str) -> str:
+        for idx, cb in enumerate(code_blocks):
+            text = text.replace(f"__CODE_BLOCK_SLOT_{idx}__", cb)
+        return text
+
+    scored = []
+    current_heading = ""
+    for idx, raw_p in enumerate(raw_paras):
+        first_line = raw_p.split("\n")[0].strip()
+        if re.match(r'^#{1,6}\s+', first_line):
+            current_heading = first_line
+
+        p_restored = restore_code(raw_p)
+        p_lower = p_restored.lower()
+
+        score = 0
+        if query_clean.lower() in p_lower:
+            score += 25
+
+        term_matches = sum(1 for term in q_terms if term in p_lower)
+        if term_matches > 0:
+            score += term_matches * 5
+            freq = sum(p_lower.count(term) for term in q_terms)
+            score += min(freq, 10)
+
+        if score > 0:
+            if 40 <= len(p_restored) <= 1500:
+                score += 2
+            scored.append((score, idx, p_restored, current_heading))
+
+    if not scored:
+        return ""
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    selected_passages = []
+    total_len = 0
+    seen_indices = set()
+
+    for score, idx, p_text, heading in scored:
+        if idx in seen_indices:
+            continue
+
+        entry = p_text
+        if heading and not p_text.startswith("#") and heading not in p_text:
+            entry = f"{heading}\n{p_text}"
+
+        entry_len = len(entry) + 4
+        if total_len + entry_len > max_chars and selected_passages:
+            break
+
+        selected_passages.append(entry)
+        seen_indices.add(idx)
+        total_len += entry_len
+
+        if total_len >= max_chars * 0.8:
+            break
+
+    result = "\n\n---\n\n".join(selected_passages)
+    if len(result) > max_chars:
+        trunc_msg = f"\n\n... [Content truncated at {max_chars} chars. Use `inspect_vault_doc` with a specific section or query for more.]"
+        result = result[:max(0, max_chars - len(trunc_msg))] + trunc_msg
+
+    return result
+
