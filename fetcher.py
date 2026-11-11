@@ -16,6 +16,7 @@ from typing import Optional, Tuple, Dict, Any
 from urllib.parse import urlparse
 from curl_cffi import requests
 import trafilatura
+from markdownify import MarkdownConverter
 import pypdf
 
 from vault import (
@@ -69,6 +70,74 @@ def clean_web_content(markdown: str) -> str:
     # Strip repetitive empty lines
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
+
+class CommonMarkConverter(MarkdownConverter):
+    """
+    Enhanced MarkdownConverter ensuring clean ATX headings and proper code fence handling.
+    """
+    def convert_pre(self, el, text, parent_tags):
+        # If <pre> is nested inside an ATX heading (h1 through h6), return inline code
+        parent = el.parent
+        while parent:
+            if parent.name in ("h1", "h2", "h3", "h4", "h5", "h6"):
+                return f" `{text.strip()}` "
+            parent = parent.parent
+
+        # If <pre> is nested inside another <pre>, unwrap without duplicating fences
+        if el.find_parent("pre"):
+            return text
+
+        return super().convert_pre(el, text, parent_tags)
+
+def _html_to_clean_markdown(html_content: str, fallback_url: str = "") -> str:
+    """
+    Two-stage HTML to CommonMark pipeline:
+    1. trafilatura extracts main content as clean semantic HTML.
+    2. markdownify converts semantic HTML to strict CommonMark.
+    Falls back gracefully if either step fails.
+    """
+    if not html_content or not str(html_content).strip():
+        return ""
+
+    extracted_html = None
+    try:
+        extracted_html = trafilatura.extract(
+            html_content,
+            output_format="html",
+            include_links=True,
+            include_images=False,
+            include_tables=True,
+            favor_recall=True,
+        )
+    except Exception as e:
+        logger.debug(f"trafilatura extraction error: {e}")
+
+    if extracted_html:
+        try:
+            converter = CommonMarkConverter(
+                heading_style="ATX",
+                strip=["script", "style", "head", "noscript", "iframe"],
+                newline_style="backslash"
+            )
+            md = converter.convert(extracted_html)
+            if md and md.strip():
+                return md.strip()
+        except Exception as e:
+            logger.warning(f"markdownify conversion error, attempting raw markdown fallback: {e}")
+
+    # Fallback: direct trafilatura markdown extraction
+    try:
+        fallback_md = trafilatura.extract(
+            html_content,
+            output_format="markdown",
+            include_links=True,
+            include_images=False,
+            favor_recall=True
+        )
+        return (fallback_md or "").strip()
+    except Exception:
+        return ""
+
 
 def extract_pdf_to_text(pdf_bytes: bytes, url: str = "") -> Tuple[bool, str, Optional[str]]:
     """Extract readable text from PDF bytes. Never returns raw bytes."""
@@ -150,13 +219,7 @@ def fetch_wayback_archive(url: str, timeout: int = 12) -> Tuple[bool, str, Optio
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
         resp = session.get(archive_url, timeout=timeout, headers=headers, verify=False)
         if resp.status_code == 200 and resp.text:
-            md = trafilatura.extract(
-                resp.text,
-                output_format="markdown",
-                include_links=True,
-                include_images=False,
-                favor_recall=True
-            )
+            md = _html_to_clean_markdown(resp.text)
             if md and len(md.strip()) > 80:
                 cleaned = clean_web_content(md)
                 return True, f"> *[Archived snapshot from Wayback Machine]*\n\n{cleaned}", None
@@ -248,13 +311,7 @@ def fetch_fast_tier(
         return False, "", resp.content, "HTTP 410 (Gone)"
 
     if resp.status_code == 200 and not is_blocked_or_challenged(resp.text, resp.status_code):
-        md = trafilatura.extract(
-            resp.text,
-            output_format="markdown",
-            include_links=True,
-            include_images=False,
-            favor_recall=True
-        )
+        md = _html_to_clean_markdown(resp.text)
         if md and len(md.strip()) > 80:
             issue = classify_page_issues(resp.text, md, url=url)
             if issue and issue != "Page loaded but main content was empty or protected":
@@ -336,13 +393,7 @@ def fetch_stealth_tier(url: str, timeout: int = 25) -> Tuple[bool, str, Optional
 
                 html = page.content()
 
-                md = trafilatura.extract(
-                    html,
-                    output_format="markdown",
-                    include_links=True,
-                    include_images=False,
-                    favor_recall=True
-                )
+                md = _html_to_clean_markdown(html)
                 if not md or len(md.strip()) < 80:
                     try:
                         body_text = page.evaluate("() => document.body ? document.body.innerText : ''")
