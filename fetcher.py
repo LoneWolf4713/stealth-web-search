@@ -25,6 +25,7 @@ from vault import (
     save_domain_cookies,
     extract_domain
 )
+from chunker import safe_truncate_markdown
 
 logger = logging.getLogger("stealth_fetcher")
 _BROWSER_LOCK = threading.Lock()
@@ -173,6 +174,8 @@ def fetch_fast_tier(
     Includes automated SSL certificate fallback and HTTP downgrade fallback.
     Returns: (success: bool, markdown: str, raw_bytes: bytes, error_reason: Optional[str])
     """
+    if not url or not str(url).strip():
+        return False, "", b"", "Missing or empty URL"
     domain = extract_domain(url)
     vault_entry = get_domain_cookies(domain)
     
@@ -305,6 +308,8 @@ def fetch_stealth_tier(url: str, timeout: int = 25) -> Tuple[bool, str, Optional
     only a page is opened/closed per fetch, not the whole browser.
     Returns: (success: bool, markdown: str, error_reason: Optional[str])
     """
+    if not url or not str(url).strip():
+        return False, "", "Missing or empty URL"
     domain = extract_domain(url)
     page = None
     try:
@@ -385,6 +390,14 @@ def fetch_page_detailed(
     3. Auto-fallback to Wayback Machine archive copy on SSL/connection dropouts.
     Guarantees 'content' is NEVER populated with an error string!
     """
+    if not url or not str(url).strip():
+        return {
+            "success": False,
+            "content": "",
+            "error_reason": "Missing or empty URL",
+            "cached": False
+        }
+
     if use_cache and not force_stealth:
         cached = get_cached_page(url)
         if cached and not cached.startswith("%PDF"):
@@ -455,10 +468,11 @@ def fetch_page(
     if res["success"]:
         content = res["content"]
         if max_chars and len(content) > max_chars:
-            content = content[:max_chars - 300] + (
+            trunc_suffix = (
                 "\n\n> [!NOTE]\n"
-                f"> *Webpage content capped at 6,000 characters to protect context window. Use `get_toc('{url}')` and `read_section` to inspect specific sections.*"
+                f"> *Webpage content capped at {max_chars:,} characters to protect context window. Use `get_toc('{url}')` and `read_section` to inspect specific sections.*"
             )
+            content = safe_truncate_markdown(content, max_chars, suffix=trunc_suffix)
         return content
     return f"Failed to retrieve {url}: {res['error_reason']}"
 

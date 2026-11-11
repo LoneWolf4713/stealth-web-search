@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from searcher import search_web, search_news
 from fetcher import fetch_page_detailed, classify_page_issues
-from chunker import chunk_markdown_smart, get_table_of_contents, extract_section
+from chunker import chunk_markdown_smart, get_table_of_contents, extract_section, safe_truncate_markdown
 from neural_fast import rerank_pages_batch, extract_entities_batch, get_device
 
 # Throttled worker count to prevent memory exhaustion in constrained (WSL) environments
@@ -106,7 +106,8 @@ def fast_intelligent_search(
     t0 = time.perf_counter()
     search_results = search_web(query, max_results=max_results, perspective=perspective)
 
-    if not search_results or "error" in search_results[0]:
+    valid_results = [r for r in (search_results or []) if isinstance(r, dict) and "error" not in r and r.get("href")]
+    if not valid_results:
         return {
             "query": query,
             "perspective": perspective,
@@ -121,7 +122,7 @@ def fast_intelligent_search(
     # run fully in parallel without touching MLHardwareLock at all).
     fetched: List[Dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_fetch_and_chunk_url, item): item for item in search_results}
+        futures = {executor.submit(_fetch_and_chunk_url, item): item for item in valid_results}
         for f in as_completed(futures):
             res = f.result()
             orig = futures[f]
@@ -165,6 +166,7 @@ def fast_intelligent_search(
         "elapsed_seconds": elapsed,
         "workers_used": max_workers,
         "total_results": len(detailed_results),
+        "total_fetched": len(detailed_results),
         "results": detailed_results
     }
 
@@ -186,6 +188,14 @@ def format_fast_digest(data: Dict[str, Any], density: Optional[str] = None) -> s
         f"*Tokens: ~0 | Chars: 0 | Density: {density.upper()} | Time: {elapsed}s on {device}*\n"
     ]
 
+    if results and isinstance(results[0], dict) and "error" in results[0]:
+        lines.append(f"> ❌ **Search Error**: {results[0]['error']}\n")
+        return "\n".join(lines)
+
+    if not results:
+        lines.append(f"> ℹ️ **No search results found** for `{data.get('query')}`. Try refining search terms.\n")
+        return "\n".join(lines)
+
     # If completely 100% of sources failed, report clear notice
     if not successful:
         lines.append("> [!WARNING]")
@@ -194,7 +204,9 @@ def format_fast_digest(data: Dict[str, Any], density: Optional[str] = None) -> s
         if failed:
             lines.append("### Failed / Inaccessible Sources:")
             for r in failed:
-                lines.append(f"- [{r.get('title')}]({r.get('url')}): *{r.get('error_reason', 'Access blocked')}*")
+                title = str(r.get('title') or r.get('url') or 'Untitled Source')
+                url = str(r.get('url') or '#')
+                lines.append(f"- [{title}]({url}): *{r.get('error_reason', 'Access blocked')}*")
         full_output = "\n".join(lines)
         est_tokens = int(len(full_output) / 4.2)
         meta_line = f"*Tokens: ~{est_tokens:,} | Chars: {len(full_output):,} | Density: {density.upper()} | Time: {elapsed}s on {device}*\n"
@@ -241,11 +253,15 @@ def format_fast_digest(data: Dict[str, Any], density: Optional[str] = None) -> s
         lead_text = paragraphs[0] if paragraphs else excerpt
         if len(lead_text) > max_lead_chars:
             lead_text = lead_text[:max_lead_chars - 10] + "..."
-        lines.append(f"> 💡 **Top Finding / Key Evidence** ([{best_source.get('title')}]({best_source.get('url')})):")
+        bs_title = str(best_source.get('title') or best_source.get('url') or 'Untitled Source')
+        bs_url = str(best_source.get('url') or '#')
+        lines.append(f"> 💡 **Top Finding / Key Evidence** ([{bs_title}]({bs_url})):")
         lines.append(f"> {lead_text}\n")
 
     def render_entry(idx: int, r: Dict[str, Any]) -> str:
-        out = [f"### {idx}. [{r.get('title')}]({r.get('url')})"]
+        title = str(r.get('title') or r.get('url') or 'Untitled Source')
+        url = str(r.get('url') or '#')
+        out = [f"### {idx}. [{title}]({url})"]
         if r.get("snippet"):
             out.append(f"**Overview**: {r.get('snippet')}\n")
 
@@ -263,7 +279,7 @@ def format_fast_digest(data: Dict[str, Any], density: Optional[str] = None) -> s
                 out.append(f"##### Section: {heading}{match_str}")
                 p_content = p.get("content", "").strip()
                 if len(p_content) > max_passage_chars:
-                    p_content = p_content[:max_passage_chars - 35] + "\n[... Passage truncated ...]"
+                    p_content = safe_truncate_markdown(p_content, max_passage_chars, suffix="\n[... Passage truncated ...]")
                 out.append(p_content)
                 out.append("")
         out.append("\n---\n")
@@ -290,17 +306,20 @@ def format_fast_digest(data: Dict[str, Any], density: Optional[str] = None) -> s
     if failed:
         lines.append("\n### ⚠️ Inaccessible / Blocked Sources:")
         for r in failed:
-            lines.append(f"- [{r.get('title')}]({r.get('url')}): *{r.get('error_reason', 'Access blocked')}*")
+            title = str(r.get('title') or r.get('url') or 'Untitled Source')
+            url = str(r.get('url') or '#')
+            lines.append(f"- [{title}]({url}): *{r.get('error_reason', 'Access blocked')}*")
         lines.append("")
 
     full_output = "\n".join(lines)
 
     # Enforce strict response character ceiling
     if len(full_output) > max_total_chars:
-        full_output = full_output[:max_total_chars - 320] + (
+        trunc_suffix = (
             "\n\n> [!NOTE]\n"
             f"> *Output capped at {max_total_chars:,} characters (truncated) to protect LLM context window. Showing most relevant passages.*"
         )
+        full_output = safe_truncate_markdown(full_output, max_total_chars, suffix=trunc_suffix)
 
     # Estimate token count (chars / 4.2 approx) and prepend to metrics
     est_tokens = int(len(full_output) / 4.2)
@@ -309,19 +328,6 @@ def format_fast_digest(data: Dict[str, Any], density: Optional[str] = None) -> s
     if len(lines_split) > 1:
         lines_split[1] = meta_line
         full_output = "\n".join(lines_split)
-
-    # Safety check: if replacing header pushed length over max_total_chars, re-cap
-    if len(full_output) > max_total_chars:
-        full_output = full_output[:max_total_chars - 320] + (
-            "\n\n> [!NOTE]\n"
-            f"> *Output capped at {max_total_chars:,} characters (truncated) to protect LLM context window. Showing most relevant passages.*"
-        )
-        est_tokens = int(len(full_output) / 4.2)
-        meta_line = f"*Tokens: ~{est_tokens:,} | Chars: {len(full_output):,} | Density: {density.upper()} | Time: {elapsed}s on {device}*\n"
-        lines_split = full_output.split("\n")
-        if len(lines_split) > 1:
-            lines_split[1] = meta_line
-            full_output = "\n".join(lines_split)
 
     return full_output
 
@@ -430,6 +436,7 @@ def deep_reasoning_search(
         "reasoning_intent": reasoning_intent or query,
         "elapsed_seconds": elapsed,
         "total_results": len(detailed_results),
+        "total_fetched": len(detailed_results),
         "results": detailed_results
     }
 
@@ -447,6 +454,14 @@ def format_deep_digest(data: Dict[str, Any]) -> str:
         f"*Perspective: {perspective.upper()} | Sources: {len(successful)}/{len(results)} accessible | Time: {elapsed}s on GPU*\n"
     ]
 
+    if results and isinstance(results[0], dict) and "error" in results[0]:
+        lines.append(f"> ❌ **Search Error**: {results[0]['error']}\n")
+        return "\n".join(lines)
+
+    if not results:
+        lines.append(f"> ℹ️ **No search results found** for `{data.get('query')}`. Try refining search terms.\n")
+        return "\n".join(lines)
+
     if not successful:
         lines.append("> [!WARNING]")
         lines.append(f"> **All {len(results)} sources were inaccessible or blocked**. No intelligence could be extracted.")
@@ -454,18 +469,22 @@ def format_deep_digest(data: Dict[str, Any]) -> str:
         if failed:
             lines.append("### Failed / Inaccessible Sources:")
             for r in failed:
-                lines.append(f"- [{r.get('title')}]({r.get('url')}): *{r.get('error_reason', 'Access blocked')}*")
+                title = str(r.get('title') or r.get('url') or 'Untitled Source')
+                url = str(r.get('url') or '#')
+                lines.append(f"- [{title}]({url}): *{r.get('error_reason', 'Access blocked')}*")
         return "\n".join(lines)
 
     def render_entry(idx: int, r: Dict[str, Any]) -> str:
-        out = [f"### {idx}. [{r.get('title')}]({r.get('url')})"]
+        title = str(r.get('title') or r.get('url') or 'Untitled Source')
+        url = str(r.get('url') or '#')
+        out = [f"### {idx}. [{title}]({url})"]
         if r.get("snippet"):
             out.append(f"**Overview**: {r.get('snippet')}\n")
         out.append("#### Extracted Intelligence & Details:")
         intel = r.get("extracted_intelligence", "").strip()
         # Per-source length safety cap
         if len(intel) > 2500:
-            intel = intel[:2450] + "\n[... Intelligence truncated ...]"
+            intel = safe_truncate_markdown(intel, 2500, suffix="\n[... Intelligence truncated ...]")
         out.append(intel)
         out.append("\n---\n")
         return "\n".join(out)
@@ -490,16 +509,19 @@ def format_deep_digest(data: Dict[str, Any]) -> str:
     if failed:
         lines.append("\n### ⚠️ Inaccessible / Blocked Sources:")
         for r in failed:
-            lines.append(f"- [{r.get('title')}]({r.get('url')}): *{r.get('error_reason', 'Access blocked')}*")
+            title = str(r.get('title') or r.get('url') or 'Untitled Source')
+            url = str(r.get('url') or '#')
+            lines.append(f"- [{title}]({url}): *{r.get('error_reason', 'Access blocked')}*")
         lines.append("")
 
     full_output = "\n".join(lines)
 
     if len(full_output) > MAX_TOTAL_OUTPUT_CHARS:
-        full_output = full_output[:MAX_TOTAL_OUTPUT_CHARS - 320] + (
+        trunc_suffix = (
             "\n\n> [!NOTE]\n"
             f"> *Output capped at {MAX_TOTAL_OUTPUT_CHARS:,} characters (truncated) to protect LLM context window.*"
         )
+        full_output = safe_truncate_markdown(full_output, MAX_TOTAL_OUTPUT_CHARS, suffix=trunc_suffix)
 
     est_tokens = int(len(full_output) / 4.2)
     meta_line = f"*Tokens: ~{est_tokens:,} | Chars: {len(full_output):,} | Perspective: {perspective.upper()} | Time: {elapsed}s on GPU*\n"

@@ -18,6 +18,7 @@ heavy processes.
 """
 import os
 import sys
+from typing import Optional
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
@@ -206,7 +207,7 @@ def record_research_fact(
     source_url: str = "",
     source_title: str = "",
     pass_num: int = 1,
-    tags: list[str] = []
+    tags: Optional[list[str]] = None
 ) -> str:
     """
     Record an established research fact, finding, or milestone into the persistent SQLite research ledger.
@@ -226,6 +227,7 @@ def record_research_fact(
         pass_num: Research pass iteration number (default: 1).
         tags: Optional list of keyword tags for filtering and indexing.
     """
+    tags = tags or []
     return daemon_request(
         "record_research_fact",
         category=category,
@@ -238,7 +240,7 @@ def record_research_fact(
     )
 
 @mcp.tool()
-def get_research_ledger(category: str = None, tier: int = None) -> str:
+def get_research_ledger(category: Optional[str] = None, tier: Optional[int] = None) -> str:
     """
     Retrieve established research facts from the persistent SQLite ledger as a token-dense Markdown briefing.
     
@@ -254,7 +256,7 @@ def get_research_ledger(category: str = None, tier: int = None) -> str:
     return daemon_request("get_research_ledger", category=category, tier=tier)
 
 @mcp.tool()
-def clear_research_ledger(category: str = None, confirm: bool = False) -> str:
+def clear_research_ledger(category: Optional[str] = None, confirm: bool = False) -> str:
     """
     Clear research ledger entries from the SQLite database.
     Requires confirm=True to prevent accidental data loss.

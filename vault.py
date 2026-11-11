@@ -10,23 +10,52 @@ import hashlib
 import json
 import time
 import uuid
+import math
 from datetime import datetime, timezone
 from collections import defaultdict
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 from typing import Optional, Dict, Any, List
+from contextlib import contextmanager
 
 from chunker import extract_headings, extract_section, find_query_passages
+try:
+    from chunker import safe_truncate_markdown
+except ImportError:
+    # Fallback in case chunker.py is compiled or imported before safe_truncate_markdown is added
+    def safe_truncate_markdown(text: str, max_chars: int, suffix: str = "") -> str:
+        if not text or len(text) <= max_chars:
+            return text
+        target_len = max(0, max_chars - len(suffix))
+        if target_len <= 0:
+            return suffix[:max_chars]
+        slice_candidate = text[:target_len]
+        last_newline = slice_candidate.rfind("\n")
+        if last_newline > int(target_len * 0.8):
+            truncated = slice_candidate[:last_newline]
+        else:
+            truncated = slice_candidate
+        # Check for unclosed code fences
+        fence_matches = [m for m in truncated.split("\n") if m.strip().startswith("```")]
+        if len(fence_matches) % 2 != 0:
+            truncated = truncated.rstrip() + "\n```"
+        return truncated + suffix
 
 VAULT_DIR = os.path.expanduser("~/.cache/web_search_tool")
 os.makedirs(VAULT_DIR, exist_ok=True)
 VAULT_DB_PATH = os.path.join(VAULT_DIR, "vault.sqlite")
+_last_cleanup: float = 0.0
 
-def get_connection() -> sqlite3.Connection:
+@contextmanager
+def get_connection():
+    """Context manager providing thread-safe SQLite connection with guaranteed closure."""
     conn = sqlite3.connect(VAULT_DB_PATH, timeout=30.0)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA busy_timeout = 30000;")
-    return conn
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA busy_timeout = 30000;")
+        yield conn
+    finally:
+        conn.close()
 
 def init_vault():
     with get_connection() as conn:
@@ -78,6 +107,9 @@ def init_vault():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_staged_expires ON staged_documents(expires_at);")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_staged_session ON staged_documents(session_id);")
         conn.execute("DELETE FROM staged_documents WHERE expires_at < ?", (time.time(),))
+        conn.execute("DELETE FROM search_cache WHERE (created_at + ttl_seconds) < ?", (time.time(),))
+        conn.execute("DELETE FROM page_cache WHERE (created_at + ttl_seconds) < ?", (time.time(),))
+        conn.execute("DELETE FROM cookie_vault WHERE (created_at + ttl_seconds) < ?", (time.time(),))
 
         # Persistent Research State Ledger
         conn.execute("""
@@ -98,18 +130,42 @@ def init_vault():
 
 init_vault()
 
-def _normalize_query(query: str) -> str:
+def _normalize_query(query: Any) -> str:
     """Normalize query by stripping whitespace, collapsing internal whitespace, and lowercasing."""
-    if not query:
+    if query is None:
         return ""
-    return " ".join(query.strip().lower().split())
+    return " ".join(str(query).strip().lower().split())
 
 def _hash(val: str) -> str:
     return hashlib.sha256(_normalize_query(val).encode("utf-8")).hexdigest()
 
+def _hash_url(url: str) -> str:
+    """
+    Generate SHA-256 hash for a URL preserving path and query case sensitivity.
+    Lowercases scheme and hostname (netloc), strictly preserving casing of path and query.
+    Strips URL fragments so anchor links map to the same cached resource.
+    Strips trailing slash on path if root, while keeping query params intact.
+    """
+    if not url:
+        return hashlib.sha256(b"").hexdigest()
+    url_str = str(url).strip()
+    try:
+        parts = urlsplit(url_str)
+        scheme = parts.scheme.lower()
+        netloc = parts.netloc.lower()
+        # Normalize trailing slash on path (e.g. /docs/api/ -> /docs/api)
+        norm_path = parts.path.rstrip("/") if parts.path != "/" else "/"
+        canonical_url = urlunsplit((scheme, netloc, norm_path, parts.query, ""))
+    except Exception:
+        canonical_url = url_str
+    return hashlib.sha256(canonical_url.encode("utf-8")).hexdigest()
+
 def extract_domain(url: str) -> str:
-    parsed = urlparse(url)
-    return parsed.netloc.lower()
+    if not url:
+        return ""
+    parsed = urlparse(str(url))
+    netloc = parsed.netloc if isinstance(parsed.netloc, str) else parsed.netloc.decode("utf-8", "ignore")
+    return netloc.lower()
 
 # --- Search Cache ---
 def get_cached_search(query: str, max_age_hours: float = 12.0) -> Optional[List[Dict[str, Any]]]:
@@ -135,18 +191,25 @@ def set_cached_search(query: str, results: List[Dict[str, Any]], ttl_hours: floa
     now = time.time()
     res_json = json.dumps(results)
     try:
+        ttl = float(ttl_hours)
+        if math.isnan(ttl) or math.isinf(ttl) or ttl <= 0:
+            ttl = 12.0
+        ttl = min(ttl, 365.0 * 24)
+    except (ValueError, TypeError):
+        ttl = 12.0
+    try:
         with get_connection() as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO search_cache (query_hash, query_text, result_json, created_at, ttl_seconds)
                 VALUES (?, ?, ?, ?, ?)
-            """, (q_hash, norm_q, res_json, now, ttl_hours * 3600))
+            """, (q_hash, norm_q, res_json, now, ttl * 3600))
             conn.commit()
     except Exception:
         pass
 
 # --- Page Cache ---
 def get_cached_page(url: str, max_age_hours: float = 48.0) -> Optional[str]:
-    u_hash = _hash(url)
+    u_hash = _hash_url(url)
     now = time.time()
     try:
         with get_connection() as conn:
@@ -169,20 +232,30 @@ def get_cached_page(url: str, max_age_hours: float = 48.0) -> Optional[str]:
 def set_cached_page(url: str, content: str, ttl_hours: float = 48.0):
     if not content or len(content.strip()) < 50 or content.startswith("%PDF-") or content.startswith("%PDF"):
         return
-    u_hash = _hash(url)
+    u_hash = _hash_url(url)
     now = time.time()
+    try:
+        ttl = float(ttl_hours)
+        if math.isnan(ttl) or math.isinf(ttl) or ttl <= 0:
+            ttl = 48.0
+        ttl = min(ttl, 365.0 * 24)
+    except (ValueError, TypeError):
+        ttl = 48.0
     try:
         with get_connection() as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO page_cache (url_hash, url, content_markdown, created_at, ttl_seconds)
                 VALUES (?, ?, ?, ?, ?)
-            """, (u_hash, url, content, now, ttl_hours * 3600))
+            """, (u_hash, url, content, now, ttl * 3600))
             conn.commit()
     except Exception:
         pass
 
 # --- Cookie Vault ---
 def get_domain_cookies(url_or_domain: str) -> Optional[Dict[str, Any]]:
+    if not url_or_domain:
+        return None
+    url_or_domain = str(url_or_domain)
     domain = extract_domain(url_or_domain) if "://" in url_or_domain else url_or_domain.lower()
     now = time.time()
     try:
@@ -202,6 +275,9 @@ def get_domain_cookies(url_or_domain: str) -> Optional[Dict[str, Any]]:
     return None
 
 def save_domain_cookies(url_or_domain: str, cookies: Dict[str, str], user_agent: str, ttl_hours: float = 4.0):
+    if not url_or_domain:
+        return
+    url_or_domain = str(url_or_domain)
     domain = extract_domain(url_or_domain) if "://" in url_or_domain else url_or_domain.lower()
     now = time.time()
     try:
@@ -221,19 +297,49 @@ def stage_document(
     title: str,
     content: str,
     session_id: str = "default",
-    ttl_days: float = 7.0
+    ttl_days: float = 7.0,
+    headings: Optional[List[Dict[str, Any]]] = None
 ) -> Dict[str, Any]:
     """
     Stage a full document out-of-band in the vault.
     Generates a unique collision-free doc_id and stores TOC metadata.
     """
+    global _last_cleanup
+    now = time.time()
+    if (now - _last_cleanup) > 3600.0:
+        try:
+            clean_expired_staged_docs()
+        except Exception:
+            pass
+        _last_cleanup = now
+
+    url = str(url or "")
+    title = str(title or "Untitled")
+    session_id = str(session_id or "default")
+    content = str(content or "")
+
+    try:
+        ttl = float(ttl_days)
+        if math.isnan(ttl) or math.isinf(ttl) or ttl <= 0:
+            ttl = 7.0
+        ttl = min(ttl, 365.0)  # Cap max TTL at 365 days
+    except (ValueError, TypeError):
+        ttl = 7.0
+    ttl_days = ttl
+
     doc_id = f"doc_{uuid.uuid4().hex[:12]}"
-    headings = extract_headings(content)
+    if headings is None:
+        try:
+            headings = extract_headings(content)
+        except Exception:
+            headings = []
+    elif not isinstance(headings, list):
+        headings = []
+
     char_count = len(content)
     token_count = int(char_count / 4.2)
-    now = time.time()
     expires_at = now + (ttl_days * 86400.0)
-    toc_json = json.dumps(headings)
+    toc_json = json.dumps(headings, default=str)
 
     with get_connection() as conn:
         conn.execute("""
@@ -266,6 +372,8 @@ def get_staged_document(doc_id: str) -> Optional[Dict[str, Any]]:
     Fetch a staged document from the vault by doc_id.
     Returns None if missing or expired.
     """
+    if not doc_id:
+        return None
     now = time.time()
     try:
         with get_connection() as conn:
@@ -274,14 +382,19 @@ def get_staged_document(doc_id: str) -> Optional[Dict[str, Any]]:
                 SELECT doc_id, session_id, url, title, content_markdown, toc_json,
                        char_count, token_count, created_at, expires_at
                 FROM staged_documents WHERE doc_id = ?
-            """, (doc_id,))
+            """, (str(doc_id),))
             row = cur.fetchone()
             if row:
                 (d_id, session_id, url, title, content, toc_json,
                  char_count, token_count, created_at, expires_at) = row
                 if now > expires_at:
+                    conn.execute("DELETE FROM staged_documents WHERE doc_id = ?", (str(doc_id),))
+                    conn.commit()
                     return None
-                headings = json.loads(toc_json) if toc_json else []
+                try:
+                    headings = json.loads(toc_json) if toc_json else []
+                except Exception:
+                    headings = []
                 return {
                     "doc_id": d_id,
                     "session_id": session_id,
@@ -301,16 +414,40 @@ def get_staged_document(doc_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 def clean_expired_staged_docs() -> int:
-    """Purge expired staged documents from the vault."""
+    """Purge expired staged documents and expired cache rows from the vault."""
     now = time.time()
     try:
         with get_connection() as conn:
             cur = conn.cursor()
             cur.execute("DELETE FROM staged_documents WHERE expires_at < ?", (now,))
+            staged_purged = cur.rowcount
+            cur.execute("DELETE FROM search_cache WHERE (created_at + ttl_seconds) < ?", (now,))
+            cur.execute("DELETE FROM page_cache WHERE (created_at + ttl_seconds) < ?", (now,))
+            cur.execute("DELETE FROM cookie_vault WHERE (created_at + ttl_seconds) < ?", (now,))
             conn.commit()
-            return cur.rowcount
+            return staged_purged
     except Exception:
         return 0
+
+def clean_expired_cache() -> Dict[str, int]:
+    """Purge expired rows from search_cache, page_cache, cookie_vault, and staged_documents."""
+    now = time.time()
+    purged = {"search_cache": 0, "page_cache": 0, "cookie_vault": 0, "staged_documents": 0}
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM search_cache WHERE (created_at + ttl_seconds) < ?", (now,))
+            purged["search_cache"] = cur.rowcount
+            cur.execute("DELETE FROM page_cache WHERE (created_at + ttl_seconds) < ?", (now,))
+            purged["page_cache"] = cur.rowcount
+            cur.execute("DELETE FROM cookie_vault WHERE (created_at + ttl_seconds) < ?", (now,))
+            purged["cookie_vault"] = cur.rowcount
+            cur.execute("DELETE FROM staged_documents WHERE expires_at < ?", (now,))
+            purged["staged_documents"] = cur.rowcount
+            conn.commit()
+    except Exception:
+        pass
+    return purged
 
 def extract_staged_slice(
     doc_id: str,
@@ -320,47 +457,50 @@ def extract_staged_slice(
 ) -> str:
     """
     Extract a targeted slice (by section heading/index or query keywords) from a staged document.
-    Enforces max_chars ceiling with clean truncation indicator.
+    Enforces max_chars ceiling with clean syntax-aware markdown truncation indicator.
     """
+    try:
+        max_chars = int(max_chars)
+    except (ValueError, TypeError):
+        max_chars = 1500
+
     doc = get_staged_document(doc_id)
     if not doc:
         return f"Error: Document '{doc_id}' was not found or has expired (7-day TTL). Please re-fetch the document from its original URL."
 
     content = doc.get("content_markdown") or doc.get("content", "")
     headings = doc.get("headings", [])
+    trunc_suffix = f"\n\n... [Content truncated at {max_chars} chars. Use `inspect_vault_doc` with a specific section or query for more.]"
 
-    def apply_truncation(text: str, limit: int) -> str:
-        if len(text) > limit:
-            indicator = f"\n\n... [Content truncated at {limit} chars. Use `inspect_vault_doc` with a specific section or query for more.]"
-            return text[:max(0, limit - len(indicator))] + indicator
-        return text
+    section_str = str(section or "").strip()
+    query_str = str(query or "").strip()
 
     # Case 1: Specific section requested
-    if section and section.strip():
-        sec_clean = section.strip()
+    if section_str:
+        sec_clean = section_str
         sec_text = extract_section(content, sec_clean)
         if not sec_text.startswith(f"Section '{sec_clean}' not found"):
-            # Section found. If query is also provided and section is long, focus on query inside section
-            if query and query.strip() and len(sec_text) > max_chars:
-                q_passages = find_query_passages(sec_text, query.strip(), max_chars=max_chars)
+            # Section found. If query is also provided, focus on query inside section
+            if query_str:
+                q_passages = find_query_passages(sec_text, query_str, max_chars=max_chars)
                 if q_passages:
-                    return apply_truncation(q_passages, max_chars)
-            return apply_truncation(sec_text, max_chars)
+                    return safe_truncate_markdown(q_passages, max_chars, suffix=trunc_suffix)
+                return f"No passages found matching query '{query_str}' in section '{sec_clean}' of document '{doc_id}'."
+            return safe_truncate_markdown(sec_text, max_chars, suffix=trunc_suffix)
         else:
-            # Section not found. If query provided, fallback to query search across full document
-            if not (query and query.strip()):
-                return sec_text
+            sections_summary = ", ".join(f"`{h.get('title', str(h)) if isinstance(h, dict) else str(h)}`" for h in headings[:8]) if headings else "None"
+            return f"Error: Section '{sec_clean}' was not found in document '{doc_id}'. Available sections: {sections_summary}."
 
-    # Case 2: Query requested (or fallback from section not found)
-    if query and query.strip():
-        q_passages = find_query_passages(content, query.strip(), max_chars=max_chars)
+    # Case 2: Query requested
+    if query_str:
+        q_passages = find_query_passages(content, query_str, max_chars=max_chars)
         if q_passages:
-            return apply_truncation(q_passages, max_chars)
-        sections_summary = ", ".join(f"`{h['title']}`" for h in headings[:8]) if headings else "None"
-        return f"No passages found matching query '{query}' in document '{doc_id}'. Available sections: {sections_summary}."
+            return safe_truncate_markdown(q_passages, max_chars, suffix=trunc_suffix)
+        sections_summary = ", ".join(f"`{h.get('title', str(h)) if isinstance(h, dict) else str(h)}`" for h in headings[:8]) if headings else "None"
+        return f"No passages found matching query '{query_str}' in document '{doc_id}'. Available sections: {sections_summary}."
 
     # Case 3: Neither section nor query provided: return beginning of document
-    return apply_truncation(content, max_chars)
+    return safe_truncate_markdown(content, max_chars, suffix=trunc_suffix)
 
 def inspect_staged_doc(
     doc_id: str,
@@ -387,7 +527,18 @@ def record_fact(
     Record an established research fact or finding into the persistent SQLite ledger.
     Returns the integer primary key of the inserted row.
     """
-    tags_json = json.dumps(tags or [])
+    category_clean = str(category or "general").strip()
+    fact_clean = str(fact_text or "").strip()
+    try:
+        tier_int = int(tier)
+    except (ValueError, TypeError, OverflowError):
+        tier_int = 1
+    try:
+        pass_int = int(pass_num)
+    except (ValueError, TypeError, OverflowError):
+        pass_int = 1
+
+    tags_json = json.dumps(list(tags) if isinstance(tags, (list, tuple, set)) else [], default=str)
     now = time.time()
     with get_connection() as conn:
         cur = conn.cursor()
@@ -396,12 +547,12 @@ def record_fact(
                 category, tier, pass_num, fact_text, source_url, source_title, tags_json, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            category.strip(),
-            tier,
-            pass_num,
-            fact_text.strip(),
-            (source_url or "").strip(),
-            (source_title or "").strip(),
+            category_clean,
+            tier_int,
+            pass_int,
+            fact_clean,
+            str(source_url or "").strip(),
+            str(source_title or "").strip(),
             tags_json,
             now
         ))
@@ -417,18 +568,23 @@ def get_ledger_entries(
     Query research ledger entries matching optional category and tier filters.
     Ordered by category, tier, pass_num, created_at.
     """
+    category = str(category).strip() if category is not None else None
     query = """
         SELECT id, category, tier, pass_num, fact_text, source_url, source_title, tags_json, created_at
         FROM research_ledger
     """
     params = []
     conditions = []
-    if category is not None and category.strip():
+    if category:
         conditions.append("category = ?")
-        params.append(category.strip())
+        params.append(category)
     if tier is not None:
-        conditions.append("tier = ?")
-        params.append(tier)
+        try:
+            tier_val = int(tier)
+            conditions.append("tier = ?")
+            params.append(tier_val)
+        except (ValueError, TypeError, OverflowError):
+            pass
 
     if conditions:
         query += " WHERE " + " AND ".join(conditions)
@@ -464,6 +620,7 @@ def get_ledger_markdown(
     Formatted specifically so an AI agent can inject this as the opening context for a fresh session
     after flushing its conversational history.
     """
+    category = str(category).strip() if category is not None else None
     entries = get_ledger_entries(category=category, tier=tier)
     if not entries:
         filter_desc = []
@@ -493,9 +650,12 @@ def get_ledger_markdown(
                     src_parts.append(f"[{label}]({url})")
 
                 tags = item.get("tags", [])
-                tag_str = f" `[{', '.join(tags)}]`" if tags else ""
+                tag_str = f" `[{', '.join(str(t) for t in tags)}]`" if tags else ""
 
-                dt_str = datetime.fromtimestamp(item["created_at"], timezone.utc).strftime("%Y-%m-%d")
+                try:
+                    dt_str = datetime.fromtimestamp(float(item["created_at"]), timezone.utc).strftime("%Y-%m-%d")
+                except (ValueError, TypeError, OverflowError, OSError):
+                    dt_str = "unknown-date"
 
                 src_info = f" ({', '.join(src_parts)} | {dt_str})" if src_parts else f" ({dt_str})"
                 pass_info = f" [Pass {item['pass_num']}]" if item.get("pass_num") else ""
@@ -515,13 +675,18 @@ def clear_ledger(
     If category is provided, clears only that category; otherwise clears all.
     Returns count of deleted facts.
     """
-    if not confirm:
+    if isinstance(confirm, str):
+        is_confirmed = confirm.strip().lower() in ("true", "1", "yes")
+    else:
+        is_confirmed = bool(confirm)
+
+    if not is_confirmed:
         return "Action aborted: confirm=True is required to clear research ledger entries."
 
     with get_connection() as conn:
         cur = conn.cursor()
-        if category and category.strip():
-            cat = category.strip()
+        if category and str(category).strip():
+            cat = str(category).strip()
             cur.execute("DELETE FROM research_ledger WHERE category = ?", (cat,))
             count = cur.rowcount
             conn.commit()

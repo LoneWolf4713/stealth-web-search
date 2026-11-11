@@ -5,8 +5,10 @@ CLI entry point for web search and information retrieval.
 import os
 import sys
 import json
+import socket
 import warnings
 import logging
+from typing import Optional, List
 
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -28,6 +30,24 @@ from neural_fast import get_device
 
 app = typer.Typer(help="Web Search & Information Retrieval CLI for AI Coding Agents")
 console = Console()
+
+def _is_daemon_alive() -> bool:
+    """Check if the shared background daemon is currently running and responsive."""
+    try:
+        from daemon_client import SOCKET_PATH
+        if not os.path.exists(SOCKET_PATH):
+            return False
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(0.5)
+        try:
+            sock.connect(SOCKET_PATH)
+            return True
+        except (ConnectionRefusedError, FileNotFoundError, OSError):
+            return False
+        finally:
+            sock.close()
+    except Exception:
+        return False
 
 @app.command()
 def search(
@@ -61,15 +81,48 @@ def fetch(
     no_cache: bool = typer.Option(False, "--no-cache", help="Bypass SQLite cache"),
     skip_tls_verify: bool = typer.Option(True, "--skip-tls-verify/--verify-tls", help="Bypass TLS certificate verification"),
     as_pointer: bool = typer.Option(False, "--pointer", "-p", help="Stage document out-of-band and return manifest card"),
-    output_file: str = typer.Option("", "--out", "-o", help="Save markdown to file")
+    output_file: str = typer.Option("", "--out", "-o", help="Save markdown to file"),
+    max_chars: Optional[int] = typer.Option(None, "--max-chars", "-m", help="Maximum characters to fetch (defaults to 6,000 for stdout, uncapped when --out is specified)")
 ):
     """Fetch any webpage or PDF document and convert to Markdown format."""
     console.print(f"[dim]Fetching {url}...[/dim]")
-    if as_pointer:
-        from daemon_client import daemon_request
-        content = daemon_request("fetch", url=url, force_browser=force_stealth, skip_tls_verify=skip_tls_verify, as_pointer=True)
+    if max_chars is None:
+        fetch_limit = None if output_file else 6000
     else:
-        content = fetch_page(url, force_stealth=force_stealth, use_cache=not no_cache, skip_tls_verify=skip_tls_verify)
+        fetch_limit = max_chars if max_chars > 0 else None
+
+    if as_pointer:
+        content = None
+        if _is_daemon_alive():
+            try:
+                from daemon_client import daemon_request
+                daemon_res = daemon_request(
+                    "fetch",
+                    url=url,
+                    force_browser=force_stealth,
+                    skip_tls_verify=skip_tls_verify,
+                    as_pointer=True
+                )
+                if daemon_res and not daemon_res.startswith("Daemon communication error:") and not daemon_res.startswith("Failed to reach the web-search daemon") and not daemon_res.startswith("Timed out waiting"):
+                    content = daemon_res
+            except Exception:
+                content = None
+        if content is None:
+            from daemon import _handle_fetch
+            content = _handle_fetch({
+                "url": url,
+                "force_browser": force_stealth,
+                "skip_tls_verify": skip_tls_verify,
+                "as_pointer": True
+            })
+    else:
+        content = fetch_page(
+            url,
+            force_stealth=force_stealth,
+            use_cache=not no_cache,
+            skip_tls_verify=skip_tls_verify,
+            max_chars=fetch_limit
+        )
     
     if output_file:
         with open(output_file, "w", encoding="utf-8") as f:
@@ -86,8 +139,20 @@ def inspect_cmd(
     max_chars: int = typer.Option(1500, "--max-chars", "-m", help="Maximum characters to return")
 ):
     """Inspect a section or query keywords inside a staged document in the vault."""
-    from daemon_client import daemon_request
-    res = daemon_request("inspect_vault_doc", doc_id=doc_id, query=query, section=section, max_chars=max_chars)
+    res = None
+    if _is_daemon_alive():
+        try:
+            from daemon_client import daemon_request
+            daemon_res = daemon_request("inspect_vault_doc", doc_id=doc_id, query=query, section=section, max_chars=max_chars)
+            if daemon_res and not daemon_res.startswith("Daemon communication error:") and not daemon_res.startswith("Failed to reach the web-search daemon") and not daemon_res.startswith("Timed out waiting"):
+                res = daemon_res
+        except Exception:
+            res = None
+
+    if res is None:
+        from vault import inspect_staged_doc
+        res = inspect_staged_doc(doc_id=doc_id, query=query, section=section, max_chars=max_chars)
+
     print(res)
 
 @app.command()
@@ -97,6 +162,9 @@ def toc(
     """Get the Table of Contents outline of a documentation page (~150 tokens)."""
     console.print(f"[dim]Inspecting TOC for {url}...[/dim]")
     content = fetch_page(url, max_chars=None)
+    if content.startswith("Failed to retrieve"):
+        console.print(f"[bold red]{content}[/bold red]")
+        return
     outline = get_table_of_contents(content)
     print(outline)
 
@@ -108,6 +176,9 @@ def section(
     """Extract a single targeted section from a large documentation page."""
     console.print(f"[dim]Extracting section '{target}' from {url}...[/dim]")
     content = fetch_page(url, max_chars=None)
+    if content.startswith("Failed to retrieve"):
+        console.print(f"[bold red]{content}[/bold red]")
+        return
     sec = extract_section(content, target)
     print(sec)
 
@@ -123,18 +194,39 @@ def fast(
     """Fast Neural Mode: Cross-Encoder Reranking + GLiNER Entity Extraction."""
     dev = get_device().upper()
     console.print(f"[bold cyan]Running Fast Neural Search on [{dev}] [Perspective: {perspective.upper()}] [Density: {density.upper()}] for: '{query}'[/bold cyan]")
-    data = fast_intelligent_search(
-        query,
-        max_results=max_results,
-        perspective=perspective,
-        instruction=instruction or None,
-        density=density
-    )
     
-    if json_output:
-        print(json.dumps(data, indent=2))
-    else:
-        print(format_fast_digest(data, density=density))
+    # If the shared daemon is alive and not requesting raw json, use it for warm model speed (<500ms)
+    daemon_handled = False
+    if not json_output and _is_daemon_alive():
+        try:
+            from daemon_client import daemon_request
+            res = daemon_request(
+                "fast_neural_search",
+                query=query,
+                instruction=instruction or "",
+                num_pages=max_results,
+                perspective=perspective,
+                density=density
+            )
+            if res and not res.startswith("Daemon communication error:") and not res.startswith("Failed to reach the web-search daemon"):
+                print(res)
+                daemon_handled = True
+        except Exception:
+            daemon_handled = False
+
+    if not daemon_handled:
+        data = fast_intelligent_search(
+            query,
+            max_results=max_results,
+            perspective=perspective,
+            instruction=instruction or None,
+            density=density
+        )
+        
+        if json_output:
+            print(json.dumps(data, indent=2))
+        else:
+            print(format_fast_digest(data, density=density))
 
 @app.command()
 def deep(
@@ -162,15 +254,42 @@ def batch(
     queries: list[str] = typer.Argument(..., help="Search queries to execute in batch"),
     perspective: str = typer.Option("tech", "--perspective", "-p", help="Perspective: tech (open-source), market (commercial), or dual (both)"),
     max_results: int = typer.Option(3, "--num", "-n", help="Number of pages per query"),
-    density: str = typer.Option("compact", "--density", "-d", help="Output density: compact (default, ~800 tokens), balanced (~1900 tokens), raw (~5500 tokens)")
+    density: str = typer.Option("compact", "--density", "-d", help="Output density: compact (default, ~800 tokens), balanced (~1900 tokens), raw (~5500 tokens)"),
+    json_output: bool = typer.Option(False, "--json", "-j", help="Output raw JSON")
 ):
     """Execute multiple search queries in a safe, sequential batch."""
-    for idx, q in enumerate(queries, 1):
-        console.print(f"[bold cyan]Batch Query [{idx}/{len(queries)}]: '{q}'[/bold cyan]")
-        data = fast_intelligent_search(q, max_results=max_results, perspective=perspective, density=density)
-        print(format_fast_digest(data, density=density))
-        if idx < len(queries):
-            print("\n" + "=" * 50 + "\n")
+    daemon_handled = False
+    if not json_output and _is_daemon_alive():
+        try:
+            from daemon_client import daemon_request
+            res = daemon_request(
+                "batch_search",
+                queries=queries,
+                max_results_per_query=max_results,
+                perspective=perspective,
+                density=density
+            )
+            if res and not res.startswith("Daemon communication error:") and not res.startswith("Failed to reach the web-search daemon") and not res.startswith("Timed out waiting"):
+                print(res)
+                daemon_handled = True
+        except Exception:
+            daemon_handled = False
+
+    if not daemon_handled:
+        queries = queries[:3]
+        all_results = []
+        for idx, q in enumerate(queries, 1):
+            if not json_output:
+                console.print(f"[bold cyan]Batch Query [{idx}/{len(queries)}]: '{q}'[/bold cyan]")
+            data = fast_intelligent_search(q, max_results=max_results, perspective=perspective, density=density)
+            if json_output:
+                all_results.append(data)
+            else:
+                print(format_fast_digest(data, density=density))
+                if idx < len(queries):
+                    print("\n" + "=" * 50 + "\n")
+        if json_output:
+            print(json.dumps(all_results, indent=2))
 
 @app.command("record-fact")
 def record_fact_cmd(
@@ -180,36 +299,80 @@ def record_fact_cmd(
     source: str = typer.Option("", "--source", "-s", help="Source URL"),
     title: str = typer.Option("", "--title", help="Source title"),
     pass_num: int = typer.Option(1, "--pass", "-p", help="Research pass number"),
-    tag: list[str] = typer.Option([], "--tag", help="Keyword tags (can be repeated)"),
+    tag: List[str] = typer.Option([], "--tag", help="Keyword tags (can be repeated)"),
 ):
     """Record an established fact into the persistent research ledger."""
-    from daemon_client import daemon_request
-    res = daemon_request(
-        "record_research_fact",
-        category=category,
-        tier=tier,
-        fact_text=fact,
-        source_url=source,
-        source_title=title,
-        pass_num=pass_num,
-        tags=list(tag) if tag else []
-    )
+    tag_list = list(tag) if tag else []
+    res = None
+    if _is_daemon_alive():
+        try:
+            from daemon_client import daemon_request
+            daemon_res = daemon_request(
+                "record_research_fact",
+                category=category,
+                tier=tier,
+                fact_text=fact,
+                source_url=source,
+                source_title=title,
+                pass_num=pass_num,
+                tags=tag_list
+            )
+            if daemon_res and not daemon_res.startswith("Daemon communication error:") and not daemon_res.startswith("Failed to reach the web-search daemon") and not daemon_res.startswith("Timed out waiting"):
+                res = daemon_res
+        except Exception:
+            res = None
+
+    if res is None:
+        from vault import record_fact
+        fact_id = record_fact(
+            category=category,
+            tier=tier,
+            fact_text=fact,
+            source_url=source,
+            source_title=title,
+            pass_num=pass_num,
+            tags=tag_list
+        )
+        res = f"Recorded fact #{fact_id} in category '{category}' (Tier {tier}, Pass {pass_num})."
+
     console.print(f"[bold green]{res}[/bold green]")
 
 @app.command("ledger")
 def ledger_cmd(
     category: str = typer.Option("", "--category", "-c", help="Filter by research category"),
-    tier: int = typer.Option(None, "--tier", "-t", help="Filter by tier"),
+    tier: Optional[int] = typer.Option(None, "--tier", "-t", help="Filter by tier"),
     clear: bool = typer.Option(False, "--clear", help="Clear ledger entries"),
     confirm: bool = typer.Option(False, "--confirm", help="Confirm deletion when clearing"),
 ):
     """View or manage the persistent research ledger briefing."""
-    from daemon_client import daemon_request
+    cat = category or None
     if clear:
-        res = daemon_request("clear_research_ledger", category=category or None, confirm=confirm)
+        res = None
+        if _is_daemon_alive():
+            try:
+                from daemon_client import daemon_request
+                daemon_res = daemon_request("clear_research_ledger", category=cat, confirm=confirm)
+                if daemon_res and not daemon_res.startswith("Daemon communication error:") and not daemon_res.startswith("Failed to reach the web-search daemon") and not daemon_res.startswith("Timed out waiting"):
+                    res = daemon_res
+            except Exception:
+                res = None
+        if res is None:
+            from vault import clear_ledger
+            res = clear_ledger(category=cat, confirm=confirm)
         console.print(res)
     else:
-        res = daemon_request("get_research_ledger", category=category or None, tier=tier)
+        res = None
+        if _is_daemon_alive():
+            try:
+                from daemon_client import daemon_request
+                daemon_res = daemon_request("get_research_ledger", category=cat, tier=tier)
+                if daemon_res and not daemon_res.startswith("Daemon communication error:") and not daemon_res.startswith("Failed to reach the web-search daemon") and not daemon_res.startswith("Timed out waiting"):
+                    res = daemon_res
+            except Exception:
+                res = None
+        if res is None:
+            from vault import get_ledger_markdown
+            res = get_ledger_markdown(category=cat, tier=tier)
         print(res)
 
 if __name__ == "__main__":

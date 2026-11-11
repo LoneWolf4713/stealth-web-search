@@ -18,6 +18,8 @@ import logging
 import warnings
 from typing import List, Dict, Any, Optional, Tuple
 
+from chunker import safe_truncate_markdown
+
 # Suppress progress bars and library warnings for clean CLI/MCP output
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -72,19 +74,28 @@ def load_gliner(model_name: str = "urchade/gliner_small-v2.1"):
         logger.warning(f"Could not load GLiNER: {e}")
         return None
 
+def _safe_entity_score(x: Dict[str, Any]) -> float:
+    s = x.get("score")
+    if s is None:
+        return 0.0
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return 0.0
+
 def _filter_and_dedupe_entities(raw_entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Shared post-processing for one text's raw GLiNER predictions:
     confidence sort, case-insensitive dedup, and boilerplate/timestamp filtering.
     """
-    sorted_raw = sorted(raw_entities, key=lambda x: x.get("score", 0), reverse=True)
+    sorted_raw = sorted(raw_entities, key=_safe_entity_score, reverse=True)
     seen = set()
     unique_entities = []
 
     for ent in sorted_raw:
-        clean_name = ent.get("text", "").strip()
+        clean_name = str(ent.get("text") or "").strip()
         norm = clean_name.lower()
-        lbl = ent.get("label", "entity").lower()
+        lbl = str(ent.get("label") or "entity").lower()
 
         if len(clean_name) < 2 or norm in seen:
             continue
@@ -117,8 +128,8 @@ def _filter_and_dedupe_entities(raw_entities: List[Dict[str, Any]]) -> List[Dict
         seen.add(norm)
         unique_entities.append({
             "entity": clean_name,
-            "label": ent.get("label", "entity"),
-            "score": round(float(ent.get("score", 0)), 2)
+            "label": str(ent.get("label") or "entity"),
+            "score": round(_safe_entity_score(ent), 2)
         })
         if len(unique_entities) >= 6:
             break
@@ -189,12 +200,21 @@ def load_reranker(model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"):
         logger.warning(f"Could not load Reranker: {e}")
         return None, None
 
+def _safe_relevance_score(c: Dict[str, Any], default: float = 0.0) -> float:
+    s = c.get("relevance_score")
+    if s is None:
+        return default
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return default
+
 def _dedupe_chunks(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Deduplicate chunks within a single page based on normalized leading text."""
     seen_texts = set()
     deduped = []
     for c in chunks:
-        content = c.get("content", "").strip()
+        content = str(c.get("content") or "").strip()
         key = content[:150].lower()
         if key in seen_texts:
             continue
@@ -208,18 +228,21 @@ def _select_top_chunks(scored_chunks: List[Dict[str, Any]], top_k: int) -> List[
     noise filter: keep passages with >= 12% match, or the single top passage as
     fallback if nothing clears that bar.
     """
-    sorted_chunks = sorted(scored_chunks, key=lambda x: x.get("relevance_score", 0), reverse=True)
+    sorted_chunks = sorted(scored_chunks, key=lambda x: _safe_relevance_score(x, 0.0), reverse=True)
     top_chunks = []
     for idx, c in enumerate(sorted_chunks[:top_k]):
-        pct = int(round(sigmoid(c.get("relevance_score", -99)) * 100))
+        pct = int(round(sigmoid(_safe_relevance_score(c, -99.0)) * 100))
         if pct >= 12:
             top_chunks.append(c)
         elif idx == 0:
             top_chunks.append(c)
 
     for c in top_chunks:
-        if len(c["content"]) > 1500:
-            c["content"] = c["content"][:1450] + "\n[... Passage truncated ...]"
+        c_content = str(c.get("content") or "")
+        if len(c_content) > 1500:
+            c["content"] = safe_truncate_markdown(c_content, 1500, suffix="\n[... Passage truncated ...]")
+        else:
+            c["content"] = c_content
     return top_chunks
 
 def _fallback_top_chunks(chunks: List[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
@@ -227,8 +250,11 @@ def _fallback_top_chunks(chunks: List[Dict[str, Any]], top_k: int) -> List[Dict[
     out = chunks[:top_k]
     for c in out:
         c["match_pct"] = "N/A"
-        if len(c["content"]) > 1500:
-            c["content"] = c["content"][:1450] + "\n[... Passage truncated ...]"
+        c_content = str(c.get("content") or "")
+        if len(c_content) > 1500:
+            c["content"] = safe_truncate_markdown(c_content, 1500, suffix="\n[... Passage truncated ...]")
+        else:
+            c["content"] = c_content
     return out
 
 def rerank_chunks(

@@ -35,7 +35,7 @@ def _canonical_url(url: str) -> str:
         ))
         return normalized
     except Exception:
-        return url.rstrip('/')
+        return str(url).rstrip('/') if url is not None else ""
 
 def _clean_snippet(text: str) -> str:
     """Sanitize snippet text, removing fused sitelinks, excess whitespace, and raw HTML."""
@@ -56,6 +56,13 @@ def _raw_search(
     use_cache: bool = True
 ) -> List[Dict[str, Any]]:
     """Execute raw search with URL deduplication, snippet cleaning, and SQLite cache."""
+    try:
+        max_results = int(max_results) if max_results is not None else 5
+    except (ValueError, TypeError):
+        max_results = 5
+    if max_results <= 0:
+        max_results = 5
+
     if use_cache:
         cached = get_cached_search(query)
         if cached:
@@ -109,7 +116,9 @@ def clean_agent_query(query: str) -> str:
     Cleans conversational agent queries into high-density search terms.
     e.g. 'can you please search for opportunities for 3rd year btech' -> 'opportunities for 3rd year btech'
     """
-    q = query.strip()
+    if not query:
+        return ""
+    q = str(query).strip()
     patterns = [
         r'^(can you|could you|please)\s+(tell me|find|search|look up|show me|give me)?\s*(about|for)?\s*',
         r'^(i want|i need|i am looking|i would like)\s+(to find|to search|to know|for)?\s*',
@@ -119,7 +128,7 @@ def clean_agent_query(query: str) -> str:
     for p in patterns:
         q = re.sub(p, '', q, flags=re.IGNORECASE).strip()
     q = re.sub(r'[\?!.]+$', '', q).strip()
-    return q if len(q) >= 3 else query.strip()
+    return q if (len(q) >= 2 or any(c in q for c in '+#$')) and q.strip() else str(query).strip()
 
 def search_web(
     query: str,
@@ -135,6 +144,13 @@ def search_web(
     - 'market': Focuses on commercial startups, products, pricing, and industry landscape.
     - 'dual': Executes concurrent parallel searches across both perspectives and tags results.
     """
+    try:
+        max_results = int(max_results) if max_results is not None else 5
+    except (ValueError, TypeError):
+        max_results = 5
+    if max_results <= 0:
+        max_results = 5
+
     perspective = (perspective or "tech").lower()
     q_clean = clean_agent_query(query)
 
@@ -184,6 +200,13 @@ def search_web(
 
 def search_news(query: str, max_results: int = 5, use_cache: bool = True) -> List[Dict[str, Any]]:
     """Search latest news for real-time / breaking events."""
+    try:
+        max_results = int(max_results) if max_results is not None else 5
+    except (ValueError, TypeError):
+        max_results = 5
+    if max_results <= 0:
+        max_results = 5
+
     if use_cache:
         cached = get_cached_search(f"news::{query}")
         if cached:

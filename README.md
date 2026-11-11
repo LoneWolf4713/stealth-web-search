@@ -151,8 +151,8 @@ Add this to your `~/.claude.json` or desktop configuration:
 {
   "mcpServers": {
     "web-search": {
-      "command": "/home/prtyksh/tmp/web_search_tool/.venv/bin/python",
-      "args": ["/home/prtyksh/tmp/web_search_tool/mcp_server.py"]
+      "command": "/path/to/web_search_tool/.venv/bin/python",
+      "args": ["/path/to/web_search_tool/mcp_server.py"]
     }
   }
 }
@@ -165,8 +165,8 @@ Add this to your `~/.gemini/antigravity/mcp_config.json` or project settings:
 {
   "mcpServers": {
     "web-search": {
-      "command": "/home/prtyksh/tmp/web_search_tool/.venv/bin/python",
-      "args": ["/home/prtyksh/tmp/web_search_tool/mcp_server.py"]
+      "command": "/path/to/web_search_tool/.venv/bin/python",
+      "args": ["/path/to/web_search_tool/mcp_server.py"]
     }
   }
 }
