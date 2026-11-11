@@ -76,12 +76,37 @@ class CommonMarkConverter(MarkdownConverter):
     Enhanced MarkdownConverter ensuring clean ATX headings and proper code fence handling.
     """
     def convert_pre(self, el, text, parent_tags):
-        # If <pre> is nested inside an ATX heading (h1 through h6), return inline code
+        clean_text = text.strip()
+        if not clean_text:
+            return ""
+
+        # Check inline context:
+        # Trafilatura frequently rewrites inline <code class="..."> into <pre>...</pre>.
+        # If <pre> appears inside links (<a>), table cells (<td>, <th>), headings (<h1>-<h6>),
+        # or inside paragraphs/lists/spans as a short single-line snippet (<120 chars without \n),
+        # it must be formatted as inline code (`...`) to prevent breaking CommonMark syntax.
         parent = el.parent
+        is_inline = False
+        is_link = False
         while parent:
-            if parent.name in ("h1", "h2", "h3", "h4", "h5", "h6"):
-                return f" `{text.strip()}` "
+            p_name = getattr(parent, "name", "")
+            if p_name in ("h1", "h2", "h3", "h4", "h5", "h6", "td", "th"):
+                is_inline = True
+                break
+            if p_name == "a":
+                is_inline = True
+                is_link = True
+                break
+            if p_name in ("p", "li", "span", "b", "strong", "em", "i", "blockquote") and ("\n" not in clean_text and len(clean_text) < 120):
+                is_inline = True
+                break
             parent = parent.parent
+
+        if is_inline:
+            delim = "``" if "`" in clean_text else "`"
+            if is_link:
+                return f"{delim}{clean_text}{delim}"
+            return f" {delim}{clean_text}{delim} "
 
         # If <pre> is nested inside another <pre>, unwrap without duplicating fences
         if el.find_parent("pre"):

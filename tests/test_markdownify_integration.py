@@ -295,6 +295,30 @@ class TestFetchPageIntegration(unittest.TestCase):
         # Heading should be ATX style
         self.assertIn("# Integration Guide", content)
 
+    def test_inline_pre_in_hyperlink_rendered_as_inline_code(self):
+        """Regression test: <pre> inside <a> must render as inline code without block fences."""
+        converter = CommonMarkConverter(heading_style="ATX")
+        html = '<p>Check <a href="http://example.com/doc"><pre>PYTHON_BASIC_REPL</pre></a> setting.</p>'
+        md = converter.convert(html).strip()
+        self.assertNotIn("[```", md, "Block code fences must not exist inside link text")
+        self.assertIn("[`PYTHON_BASIC_REPL`](http://example.com/doc)", md)
+
+    def test_inline_pre_in_table_cell_rendered_as_inline_code(self):
+        """Regression test: <pre> inside <td> must render as inline code, not multiline fences."""
+        converter = CommonMarkConverter(heading_style="ATX")
+        html = '<table><tr><th>Ext</th></tr><tr><td><pre>.md</pre></td></tr></table>'
+        md = converter.convert(html).strip()
+        self.assertNotIn("```", md, "Triple backticks should not appear in table cells")
+        self.assertIn("`.md`", md)
+
+    def test_inline_pre_single_token_in_paragraph(self):
+        """Regression test: single-token <pre> inside paragraph must render as inline code."""
+        converter = CommonMarkConverter(heading_style="ATX")
+        html = '<p>Gruber wrote <pre>Markdown.pl</pre>, which converts text.</p>'
+        md = converter.convert(html).strip()
+        self.assertNotIn("```", md)
+        self.assertIn("`Markdown.pl`", md)
+
 
 if __name__ == "__main__":
     unittest.main()
